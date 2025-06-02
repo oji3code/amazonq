@@ -1,0 +1,172 @@
+==========================================================
+# Create Environmental Variables
+#==========================================================
+
+export ENV="dev"
+export PROJECT="ws-devops"
+export PREFIX="${ENV}-${PROJECT}"
+export CLUSTER_NAME="${PREFIX}-eks"
+export AWS_REGION="ap-northeast-1"
+export AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+export CLUSTER_ENDPOINT=$(aws eks describe-cluster --name ${CLUSTER_NAME} --query "cluster.endpoint" --output text)
+export KARPENTER_VERSION=v0.27.5
+
+#==========================================================
+# Delete NodePool and EC2NodeClass Resources
+#==========================================================
+
+# List existing NodePools
+kubectl get nodepool
+
+# Delete NodePools
+kubectl delete nodepool ${PREFIX}-default
+
+# List existing EC2NodeClasses
+kubectl get ec2nodeclass
+
+# Delete EC2NodeClasses
+kubectl delete ec2nodeclass ${PREFIX}-default
+
+#==========================================================
+# Wait for Karpenter-Managed Nodes to Terminate
+#==========================================================
+
+# Check for any remaining nodes with the Karpenter label
+kubectl get nodes -l karpenter.sh/provisioner-name
+
+# You can force deletion if needed (use with caution)
+for node in $(kubectl get nodes -l karpenter.sh/provisioner-name -o name); do
+  kubectl delete $node --force --grace-period=0
+done
+
+#==========================================================
+# Delete Karpenter Kubernetes Resources
+#==========================================================
+
+# Delete the webhook configurations
+kubectl delete mutatingwebhookconfiguration ${PREFIX}-karpenter
+kubectl delete validatingwebhookconfiguration ${PREFIX}-karpenter
+
+# Delete the Karpenter deployment and service
+kubectl delete deployment ${PREFIX}-karpenter -n karpenter
+kubectl delete service ${PREFIX}-karpenter -n karpenter
+
+# Delete RBAC resources
+kubectl delete clusterrolebinding ${PREFIX}-karpenter
+kubectl delete clusterrole ${PREFIX}-karpenter
+kubectl delete serviceaccount karpenter -n karpenter
+
+# Delete the namespace (only if it doesn't contain other resources you want to keep)
+kubectl delete namespace karpenter
+
+#==========================================================
+# Delete Karpenter CRDs
+#==========================================================
+
+# Delete NodePool CRD
+kubectl delete crd nodepools.karpenter.sh
+
+# Delete EC2NodeClass CRD
+kubectl delete crd ec2nodeclasses.karpenter.k8s.aws
+
+# Delete NodeClaim CRD (if it exists)
+kubectl delete crd nodeclaims.karpenter.sh
+
+#==========================================================
+# Remove AWS IAM Resources
+#==========================================================
+
+# Detach policies from the node role
+aws iam detach-role-policy \
+  --role-name "${PREFIX}-KarpenterNodeRole" \
+  --policy-arn "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+
+aws iam detach-role-policy \
+  --role-name "${PREFIX}-KarpenterNodeRole" \
+  --policy-arn "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+
+aws iam detach-role-policy \
+  --role-name "${PREFIX}-KarpenterNodeRole" \
+  --policy-arn "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+
+aws iam detach-role-policy \
+  --role-name "${PREFIX}-KarpenterNodeRole" \
+  --policy-arn "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+# Remove the role from the instance profile
+aws iam remove-role-from-instance-profile \
+  --instance-profile-name "${PREFIX}-KarpenterNodeInstanceProfile" \
+  --role-name "${PREFIX}-KarpenterNodeRole"
+
+# Delete the instance profile
+aws iam delete-instance-profile \
+  --instance-profile-name "${PREFIX}-KarpenterNodeInstanceProfile"
+
+# Delete the node role
+aws iam delete-role \
+  --role-name "${PREFIX}-KarpenterNodeRole"
+
+# Delete the controller policy
+aws iam delete-role-policy \
+  --role-name "${PREFIX}-KarpenterControllerRole" \
+  --policy-name "${PREFIX}-KarpenterControllerPolicy"
+
+# Delete the controller role
+aws iam delete-role \
+  --role-name "${PREFIX}-KarpenterControllerRole"
+
+#==========================================================
+# Remove Tags from AWS Resources
+#==========================================================
+
+# Get VPC ID
+export VPC_ID=$(aws eks describe-cluster \
+  --name ${CLUSTER_NAME} \
+  --query "cluster.resourcesVpcConfig.vpcId" \
+  --output text)
+
+# Remove tags from subnets
+for SUBNET in $(aws ec2 describe-subnets \
+  --filters "Name=vpc-id,Values=${VPC_ID}" \
+  --query "Subnets[*].SubnetId" \
+  --output text); do
+  aws ec2 delete-tags \
+    --resources ${SUBNET} \
+    --tags "Key=karpenter.sh/discovery"
+done
+
+# Remove tags from security groups
+SECURITY_GROUP_ID=$(aws eks describe-cluster \
+  --name ${CLUSTER_NAME} \
+  --query "cluster.resourcesVpcConfig.clusterSecurityGroupId" \
+  --output text)
+
+aws ec2 delete-tags \
+  --resources ${SECURITY_GROUP_ID} \
+  --tags "Key=karpenter.sh/discovery"
+
+#==========================================================
+# Clean Up EC2 Resources
+#==========================================================
+
+# List and delete any launch templates created by Karpenter
+for LT in $(aws ec2 describe-launch-templates \
+  --filters "Name=tag:karpenter.sh/cluster,Values=${CLUSTER_NAME}" \
+  --query "LaunchTemplates[].LaunchTemplateId" \
+  --output text); do
+  aws ec2 delete-launch-template --launch-template-id ${LT}
+done
+
+#==========================================================
+# Verify Cleanup
+#==========================================================
+
+# Check for any remaining Karpenter CRDs
+kubectl get crd | grep karpenter
+
+# Check for any remaining Karpenter resources
+kubectl get all -n karpenter
+
+# Check for any remaining Karpenter-managed nodes
+kubectl get nodes -l karpenter.sh/provisioner-name
+
