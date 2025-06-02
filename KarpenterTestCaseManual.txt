@@ -14,8 +14,16 @@
 # Check Karpenter pods
 kubectl get pods -n karpenter
 
-# Check Karpenter logs
-kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter -c controller
+# Verify pods are in Running state
+if kubectl get pods -n karpenter | grep -q "Running"; then
+  echo "Karpenter is running properly"
+else
+  echo "Karpenter pods are not in Running state - check installation"
+  exit 1
+fi
+
+# Check Karpenter logs for errors
+kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter -c controller | grep -i error
 
 #==========================================================
 # Create a Test Namespace
@@ -27,6 +35,9 @@ kind: Namespace
 metadata:
   name: karpenter-test
 EOF
+
+# Verify namespace creation
+kubectl get namespace karpenter-test
 
 #==========================================================
 # Create a Test Deployment
@@ -65,6 +76,12 @@ spec:
         operator: "Exists"
 EOF
 
+# Verify deployment creation
+kubectl get deployment -n karpenter-test karpenter-test
+
+# Check if pods are pending (which should trigger Karpenter)
+kubectl get pods -n karpenter-test
+
 #==========================================================
 # Monitor Node Provisioning
 #==========================================================
@@ -73,6 +90,8 @@ EOF
 kubectl get nodes -w
 
 kubectl logs -f -n karpenter -l app.kubernetes.io/name=karpenter -c controller
+
+timeout 300 bash -c 'until kubectl get nodes -l karpenter.sh/provisioner-name | grep -q "Ready"; do echo "Waiting for nodes to be provisioned..."; sleep 10; done'
 
 #==========================================================
 # Verify Pod Scheduling
@@ -83,6 +102,17 @@ kubectl get pods -n karpenter-test -o wide
 
 # Check the status of your deployment
 kubectl get deployment -n karpenter-test karpenter-test
+
+# Wait for pods to be scheduled (timeout after 5 minutes)
+timeout 300 bash -c 'until kubectl get pods -n karpenter-test | grep -q "Running"; do echo "Waiting for pods to start..."; sleep 10; done'
+
+# Verify all pods are running
+if kubectl get pods -n karpenter-test | grep -v "Running" | grep -q "karpenter-test"; then
+  echo "Some pods are not in Running state - check Karpenter logs"
+else
+  echo "All pods are running successfully"
+fi
+
 
 #==========================================================
 # Test Different Instance Types
@@ -119,6 +149,15 @@ spec:
       - key: "karpenter.sh/disruption"
         operator: "Exists"
 EOF
+
+# Verify deployment creation
+kubectl get deployment -n karpenter-test karpenter-test-large
+
+# Monitor for new node provisioning
+kubectl get nodes -w
+
+timeout 300 bash -c 'until kubectl get pods -n karpenter-test -l app=karpenter-test-large | grep -q "Running"; do echo "Waiting for large pods to start..."; sleep 10; done'
+
 
 #==========================================================
 # Test Node Consolidation
@@ -184,42 +223,37 @@ spec:
             memory: "8Gi"
 EOF
 
-Watch as Karpenter consolidates (removes) the now-empty nodes:
+# Verify deployments scaled to 0
+kubectl get deployment -n karpenter-test
 
+# Watch nodes
 kubectl get nodes -w
 
-#==========================================================
-# Test Spot Instance Interruption (Optional)
-#==========================================================
+# Note: Node consolidation depends on your NodePool's consolidationPolicy and consolidateAfter settings
+# If consolidationPolicy is set to "WhenUnderutilized" and consolidateAfter is set to a short duration,
+# nodes should be removed within a few minutes
 
-cat <<EOF | kubectl apply -f -
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: karpenter-test-pdb
-  namespace: karpenter-test
-spec:
-  minAvailable: 1
-  selector:
-    matchLabels:
-      app: karpenter-test
-EOF
+kubectl logs -f -n karpenter -l app.kubernetes.io/name=karpenter -c controller | grep -i "consolidat"
+
+#==========================================================
+# Test Multi-Architecture Support (If your NodePool supports multiple architectures, test with ARM-based workloads:)
+#==========================================================
 
 cat <<EOF | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: karpenter-test
+  name: karpenter-test-arm
   namespace: karpenter-test
 spec:
-  replicas: 3
+  replicas: 2
   selector:
     matchLabels:
-      app: karpenter-test
+      app: karpenter-test-arm
   template:
     metadata:
       labels:
-        app: karpenter-test
+        app: karpenter-test-arm
     spec:
       containers:
       - name: karpenter-test
@@ -232,13 +266,18 @@ spec:
           limits:
             cpu: "1"
             memory: "1Gi"
+      nodeSelector:
+        kubernetes.io/arch: arm64
       tolerations:
       - key: "karpenter.sh/disruption"
         operator: "Exists"
 EOF
 
+# Monitor for ARM node provisioning
+kubectl get nodes -l kubernetes.io/arch=arm64
+
 #==========================================================
-# Test Scaling with Load (Optional)
+# Test Scaling with Load(Create a horizontal pod autoscaler)
 #==========================================================
 
 cat <<EOF | kubectl apply -f -
@@ -263,7 +302,44 @@ spec:
         averageUtilization: 50
 EOF
 
-Create a load generator:
+# Verify HPA creation
+kubectl get hpa -n karpenter-test
+
+Create a test deployment with 1 replica:
+
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: karpenter-test
+  namespace: karpenter-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: karpenter-test
+  template:
+    metadata:
+      labels:
+        app: karpenter-test
+    spec:
+      containers:
+      - name: karpenter-test
+        image: public.ecr.aws/amazonlinux/amazonlinux:2
+        command: ["sh", "-c", "while true; do echo Hello Karpenter; sleep 60; done"]
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "500Mi"
+          limits:
+            cpu: "500m"
+            memory: "500Mi"
+      tolerations:
+      - key: "karpenter.sh/disruption"
+        operator: "Exists"
+EOF
+
+Create an effective load generator:
 
 cat <<EOF | kubectl apply -f -
 apiVersion: apps/v1
@@ -272,7 +348,7 @@ metadata:
   name: load-generator
   namespace: karpenter-test
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: load-generator
@@ -287,7 +363,7 @@ spec:
         command: 
         - /bin/sh
         - -c
-        - "while true; do dd if=/dev/zero of=/dev/null bs=1M count=1000; done"
+        - "while true; do yes > /dev/null; done"
         resources:
           requests:
             cpu: "100m"
@@ -297,6 +373,17 @@ spec:
             memory: "100Mi"
 EOF
 
+Monitor HPA and scaling:
+
+# Watch HPA metrics
+kubectl get hpa -n karpenter-test -w
+
+# Monitor pod scaling
+kubectl get pods -n karpenter-test -l app=karpenter-test -w
+
+# Monitor node provisioning
+kubectl get nodes -w
+
 #==========================================================
 # Analyze Karpenter Events
 #==========================================================
@@ -304,20 +391,30 @@ EOF
 # Get Karpenter events
 kubectl get events --sort-by='.lastTimestamp' | grep -i karpenter
 
+# Check NodePool status
+kubectl describe nodepool
+
+# Check EC2NodeClass status
+kubectl describe ec2nodeclass
+
 #==========================================================
 # Clean Up Test Resources
 #==========================================================
 
-cat <<EOF | kubectl delete -f -
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: karpenter-test
-EOF
+# Delete the namespace and all resources in it
+kubectl delete namespace karpenter-test
 
+# Verify namespace deletion
+kubectl get namespace karpenter-test
+
+# Verify no Karpenter-provisioned nodes remain (may take a few minutes)
+kubectl get nodes -l karpenter.sh/provisioner-name
+
+# If nodes remain, check Karpenter logs
+kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter -c controller | grep -i "terminat"
 
 #==========================================================
-# Troubleshooting Commands
+# Troubleshooting(If tests fail, use these commands to troubleshoot:)
 #==========================================================
 
 # Check Karpenter logs
@@ -335,3 +432,5 @@ kubectl describe ec2nodeclass
 # Check node conditions
 kubectl describe nodes -l karpenter.sh/provisioner-name
 
+# Check AWS API calls (if you have CloudTrail enabled)
+aws cloudtrail lookup-events --lookup-attributes AttributeKey=EventName,AttributeValue=RunInstances
