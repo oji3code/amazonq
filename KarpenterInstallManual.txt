@@ -9,14 +9,19 @@ export CLUSTER_NAME="${PREFIX}-eks"
 export AWS_REGION="ap-northeast-1"
 export AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 export CLUSTER_ENDPOINT=$(aws eks describe-cluster --name ${CLUSTER_NAME} --query "cluster.endpoint" --output text)
-export KARPENTER_VERSION=v0.27.5
+export KARPENTER_VERSION=v1.1.6
+
+#==========================================================
+# Create Directory
+#==========================================================
+mkdir -p ~/karpenter/manifests && cd ~/karpenter/manifests
 
 #==========================================================
 # Create the Node Role
 #==========================================================
 
 # Create the node IAM role
-cat <<EOF > node-trust-policy.json
+cat <<EOF > ~/karpenter/manifests/node-trust-policy.json
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -33,7 +38,7 @@ EOF
 
 aws iam create-role \
   --role-name "${PREFIX}-karpenter-node-role" \
-  --assume-role-policy-document file://node-trust-policy.json
+  --assume-role-policy-document file://~/karpenter/manifests/node-trust-policy.json
 
 # Attach required policies to the node role
 aws iam attach-role-policy \
@@ -73,7 +78,7 @@ aws iam add-role-to-instance-profile \
 export OIDC_PROVIDER=$(aws eks describe-cluster --name ${CLUSTER_NAME} --query "cluster.identity.oidc.issuer" --output text | sed -e "s/^https:\/\///")
 
 # Create the controller IAM role with OIDC trust relationship
-cat <<EOF > controller-trust-policy.json
+cat <<EOF > ~/karpenter/manifests/controller-trust-policy.json
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -96,7 +101,7 @@ EOF
 
 aws iam create-role \
   --role-name "${PREFIX}-karpenter-controller-role" \
-  --assume-role-policy-document file://controller-trust-policy.json
+  --assume-role-policy-document file://~/karpenter/manifests/controller-trust-policy.json
 
 # Create the controller policy
 cat <<EOF > karpenter-controller-policy.json
@@ -132,7 +137,7 @@ EOF
 aws iam put-role-policy \
   --role-name "${PREFIX}-karpenter-controller-role" \
   --policy-name "${PREFIX}-KarpenterControllerPolicy" \
-  --policy-document file://karpenter-controller-policy.json
+  --policy-document file://~/karpenter/manifests/karpenter-controller-policy.json
 
 #==========================================================
 # Create the service-linked role for Spot instances
@@ -177,16 +182,13 @@ aws ec2 create-tags \
 # Create karpenter namespace
 kubectl create namespace karpenter
 
-# Create a directory for Karpenter manifests
-mkdir -p karpenter-manifests && cd karpenter-manifests
-
 # Download the CRDs
-curl -L "https://raw.githubusercontent.com/aws/karpenter/${KARPENTER_VERSION}/pkg/apis/crds/karpenter.sh_nodepools.yaml" > nodepool-crd.yaml
-curl -L "https://raw.githubusercontent.com/aws/karpenter/${KARPENTER_VERSION}/pkg/apis/crds/karpenter.k8s.aws_ec2nodeclasses.yaml" > ec2nodeclass-crd.yaml
+curl -L "https://raw.githubusercontent.com/aws/karpenter/${KARPENTER_VERSION}/pkg/apis/crds/karpenter.sh_nodepools.yaml" > ~/karpenter/manifests/nodepool-crd.yaml
+curl -L "https://raw.githubusercontent.com/aws/karpenter/${KARPENTER_VERSION}/pkg/apis/crds/karpenter.k8s.aws_ec2nodeclasses.yaml" > ~/karpenter/manifests/ec2nodeclass-crd.yaml
 
 # Apply the CRDs
-kubectl apply -f nodepool-crd.yaml
-kubectl apply -f ec2nodeclass-crd.yaml
+kubectl apply -f ~/karpenter/manifests/nodepool-crd.yaml
+kubectl apply -f ~/karpenter/manifests/ec2nodeclass-crd.yaml
 
 #==========================================================
 # Create RBAC resources
@@ -278,7 +280,7 @@ spec:
         - name: CLUSTER_ENDPOINT
           value: ${CLUSTER_ENDPOINT}
         - name: AWS_DEFAULT_INSTANCE_PROFILE
-          value: ${PREFIX}-KarpenterNodeInstanceProfile
+          value: ${PREFIX}-karpenter-node-instance-profile
         - name: AWS_ENI_LIMITED_POD_DENSITY
           value: "true"
         - name: AWS_REGION
@@ -328,7 +330,7 @@ spec:
         - name: CLUSTER_ENDPOINT
           value: ${CLUSTER_ENDPOINT}
         - name: AWS_DEFAULT_INSTANCE_PROFILE
-          value: ${PREFIX}-KarpenterNodeInstanceProfile
+          value: ${PREFIX}-karpenter-node-instance-profile
         - name: AWS_ENI_LIMITED_POD_DENSITY
           value: "true"
         - name: AWS_REGION
