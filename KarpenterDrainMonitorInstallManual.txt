@@ -1,0 +1,213 @@
+#==========================================================
+# Create Namespace
+#==========================================================
+
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: node-drain-monitor
+EOF
+
+#==========================================================
+# Create SA, Role, ClusterRoleBinding
+#==========================================================
+
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: node-drain-monitor
+  namespace: node-drain-monitor
+EOF
+
+cat <<EOF | kubectl apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: node-drain-monitor
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "watch", "list"]
+EOF
+
+cat <<EOF | kubectl apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: node-drain-monitor
+subjects:
+- kind: ServiceAccount
+  name: node-drain-monitor
+  namespace: node-drain-monitor
+roleRef:
+  kind: ClusterRole
+  name: node-drain-monitor
+  apiGroup: rbac.authorization.k8s.io
+EOF
+
+#==========================================================
+# Create Secret
+#==========================================================
+
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: slack-webhook
+  namespace: node-drain-monitor
+type: Opaque
+stringData:
+  webhook-url: "https://hooks.slack.com/services/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"
+EOF
+
+#==========================================================
+# Create Deployment(Python App: Monitor for Kubernetes's Event of Node)
+#==========================================================
+
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-drain-monitor
+  namespace: node-drain-monitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: node-drain-monitor
+  template:
+    metadata:
+      labels:
+        app: node-drain-monitor
+    spec:
+      serviceAccountName: node-drain-monitor
+      containers:
+      - name: monitor
+        image: python:3.9-slim
+        command:
+        - /bin/bash
+        - -c
+        - |
+          pip install kubernetes requests
+          cat > /app/monitor.py << 'EOF_PYTHON'
+          from kubernetes import client, config, watch
+          import requests
+          import os
+          import time
+          import json
+
+          SLACK_WEBHOOK_URL = os.environ['SLACK_WEBHOOK_URL']
+
+          def main():
+            # Podが稼働しているCluster情報(接続)アクセス
+            config.load_incluster_config()
+            # API(V1)クライアントオブジェクトを生成
+            v1 = client.CoreV1Api()
+            
+            # Drain状態になったノードオブジェクトを登録するためのMapオブジェクト
+            draining_nodes = {}
+            
+            while True:
+              try:
+                # 監視オブジェクトを生成
+                w = watch.Watch()
+                # ノードのイベント(変更)をループ
+                for event in w.stream(v1.list_node, timeout_seconds=60):
+                  # ノード名取得
+                  node = event['object']
+                  node_name = node.metadata.name
+                  
+                  # Karpenter・スポットインスタンスのフラグ
+                  is_karpenter_node = False
+                  is_spot_instance = False
+                  
+                  # Karpenter・スポットインスタンス条件フラグ制御（変更ノードのlabel検索）
+                  if node.metadata.labels:
+                    is_karpenter_node = 'karpenter.sh/provisioner-name' in node.metadata.labels
+                    if is_karpenter_node and 'node.kubernetes.io/instance-type' in node.metadata.labels:
+                      if node.metadata.labels.get('karpenter.k8s.aws/capacity-type') == 'spot':
+                        is_spot_instance = True
+                  
+                  # ドレイン状態判断(Podデプロイ不可状態)
+                  is_cordoned = node.spec.unschedulable if node.spec.unschedulable else False
+                  
+                  # Drain状態のKarpenterノード名をMapオブジェクトに登録
+                  if is_karpenter_node and is_spot_instance and is_cordoned and node_name not in draining_nodes:
+
+                    # Mapオブジェクトにノード名と現在時刻をセット
+                    draining_nodes[node_name] = time.time()
+                    
+                    # インスタンス情報(ID,インスタンスタイプ,PrivateIP)の取得
+                    instance_id = node.spec.provider_id.split('/')[-1] if node.spec.provider_id else "Unknown"
+                    instance_type = node.metadata.labels.get('node.kubernetes.io/instance-type', 'Unknown')
+                    
+                    private_ip = "Unknown"
+                    for address in node.status.addresses:
+                      if address.type == "InternalIP":
+                        private_ip = address.address
+                        break
+
+                    # SlackメッセージJSON
+                    message = {
+                      "text": f":warning:*Karpenter Spot Instance Node Being Drained*:warning:",
+                      "attachments": [
+                        {
+                          "color": "#FF9900",
+                          "fields": [
+                            {"title": "Node Name", "value": node_name, "short": True},
+                            {"title": "Instance ID", "value": instance_id, "short": True},
+                            {"title": "Instance Type", "value": instance_type, "short": True},
+                            {"title": "Private IP", "value": private_ip, "short": True},
+                            {"title": "Status", "value": "Draining", "short": True}
+                          ]
+                        }
+                      ]
+                    }
+                    
+                    requests.post(SLACK_WEBHOOK_URL, json=message)
+                    print(f"Sent notification for node {node_name} being drained")
+                  
+                  # 15分以上ドレイン状態のKarpenterノード名を検出してMapオブジェクトから削除
+                  current_time = time.time()
+                  for tracked_node in list(draining_nodes.keys()):
+                    if current_time - draining_nodes[tracked_node] > 900:
+                      del draining_nodes[tracked_node]
+              except Exception as e:
+                print(f"Error in watcher: {e}")
+                time.sleep(10)
+          if __name__ == "__main__":
+                  main()
+          EOF_PYTHON
+          
+          python /app/monitor.py
+        env:
+        - name: SLACK_WEBHOOK_URL
+          valueFrom:
+            secretKeyRef:
+              name: slack-webhook
+              key: webhook-url
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+EOF
+
+#==========================================================
+# Verify Pod
+#==========================================================
+
+kubectl get pods -n node-drain-monitor
+
+#==========================================================
+# Node cordon
+#==========================================================
+
+kubectl cordon <node-name>
