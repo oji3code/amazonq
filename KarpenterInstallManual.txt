@@ -268,6 +268,7 @@ spec:
       containers:
       - name: controller
         image: public.ecr.aws/karpenter/controller:${KARPENTER_VERSION}
+        imagePullPolicy: IfNotPresent
         args:
         - --health-probe-bind-address=:8081
         - --metrics-bind-address=:8080
@@ -277,26 +278,48 @@ spec:
         - name: CLUSTER_ENDPOINT
           value: ${CLUSTER_ENDPOINT}
         - name: AWS_DEFAULT_INSTANCE_PROFILE
-          value: ${PREFIX}-karpenter-node-instance-profile
+          value: ${PREFIX}-KarpenterNodeInstanceProfile
+        - name: AWS_ENI_LIMITED_POD_DENSITY
+          value: "true"
         - name: AWS_REGION
           value: ${AWS_REGION}
         ports:
+        - containerPort: 8080
+          name: http-metrics
         - containerPort: 8081
           name: http-health
         livenessProbe:
           httpGet:
             path: /healthz
             port: http-health
+          initialDelaySeconds: 10
+          periodSeconds: 30
         readinessProbe:
           httpGet:
             path: /readyz
             port: http-health
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1000
+          seccompProfile:
+            type: RuntimeDefault
         resources:
+          limits:
+            cpu: 1
+            memory: 1Gi
           requests:
             cpu: 200m
             memory: 512Mi
       - name: webhook
         image: public.ecr.aws/karpenter/controller:${KARPENTER_VERSION}
+        imagePullPolicy: IfNotPresent
         args:
         - --webhook-bind-address=:8443
         env:
@@ -305,7 +328,9 @@ spec:
         - name: CLUSTER_ENDPOINT
           value: ${CLUSTER_ENDPOINT}
         - name: AWS_DEFAULT_INSTANCE_PROFILE
-          value: ${PREFIX}-karpenter-node-instance-profile
+          value: ${PREFIX}-KarpenterNodeInstanceProfile
+        - name: AWS_ENI_LIMITED_POD_DENSITY
+          value: "true"
         - name: AWS_REGION
           value: ${AWS_REGION}
         ports:
@@ -316,15 +341,34 @@ spec:
             path: /healthz
             port: https-webhook
             scheme: HTTPS
+          initialDelaySeconds: 10
+          periodSeconds: 30
         readinessProbe:
           httpGet:
             path: /readyz
             port: https-webhook
             scheme: HTTPS
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1000
+          seccompProfile:
+            type: RuntimeDefault
         resources:
+          limits:
+            cpu: 500m
+            memory: 500Mi
           requests:
             cpu: 100m
             memory: 256Mi
+      securityContext:
+        fsGroup: 1000
 EOF
 
 #==========================================================
@@ -364,6 +408,51 @@ webhooks:
   clientConfig:
     service:
       name: ${PREFIX}-karpenter
+      namespace: karpenter
+      path: /mutate
+  failurePolicy: Fail
+  name: defaulting.webhook.karpenter.sh
+  rules:
+  - apiGroups:
+    - karpenter.sh
+    apiVersions:
+    - v1alpha5
+    - v1beta1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - nodepools
+    - nodeclaims
+  sideEffects: None
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: ${PREFIX}-karpenter
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: ${PREFIX}-karpenter
+      namespace: karpenter
+      path: /validate
+  failurePolicy: Fail
+  name: validation.webhook.karpenter.sh
+  rules:
+  - apiGroups:
+    - karpenter.sh
+    apiVersions:
+    - v1alpha5
+    - v1beta1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - nodepools
+    - nodeclaims
+  sideEffects: None
 EOF
 
 #==========================================================
@@ -417,3 +506,17 @@ spec:
   tags:
     karpenter.sh/discovery: ${CLUSTER_NAME}
 EOF
+
+#==========================================================
+# Verification Karpenter Object
+#==========================================================
+
+# Check that Karpenter pods are running
+kubectl get pods -n karpenter
+
+# Check Karpenter logs
+kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter -c controller
+
+# Check that the webhook is working
+kubectl get mutatingwebhookconfigurations ${PREFIX}-karpenter
+kubectl get validatingwebhookconfigurations ${PREFIX}-karpenter
