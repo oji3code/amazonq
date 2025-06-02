@@ -1,0 +1,337 @@
+#==========================================================
+# Test Case
+#==========================================================
+1. Karpenter automatically provisions nodes when pods cannot be scheduled
+2. Pods are successfully scheduled on the new nodes
+3. Karpenter chooses appropriate instance types based on pod requirements
+4. Karpenter consolidates (removes) nodes when they're no longer needed
+5. No errors in the Karpenter logs during provisioning or deprovisioning
+
+#==========================================================
+# Verify Karpenter Components Are Running
+#==========================================================
+
+# Check Karpenter pods
+kubectl get pods -n karpenter
+
+# Check Karpenter logs
+kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter -c controller
+
+#==========================================================
+# Create a Test Namespace
+#==========================================================
+
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: karpenter-test
+EOF
+
+#==========================================================
+# Create a Test Deployment
+#==========================================================
+
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: karpenter-test
+  namespace: karpenter-test
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: karpenter-test
+  template:
+    metadata:
+      labels:
+        app: karpenter-test
+    spec:
+      containers:
+      - name: karpenter-test
+        image: public.ecr.aws/amazonlinux/amazonlinux:2
+        command: ["sh", "-c", "while true; do echo Hello Karpenter; sleep 60; done"]
+        resources:
+          requests:
+            cpu: "1"
+            memory: "1Gi"
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+      # Add tolerations to allow scheduling on nodes with Karpenter's disruption taint
+      tolerations:
+      - key: "karpenter.sh/disruption"
+        operator: "Exists"
+EOF
+
+#==========================================================
+# Monitor Node Provisioning
+#==========================================================
+
+# Watch for new nodes being created
+kubectl get nodes -w
+
+kubectl logs -f -n karpenter -l app.kubernetes.io/name=karpenter -c controller
+
+#==========================================================
+# Verify Pod Scheduling
+#==========================================================
+
+# Get pods and their node assignments
+kubectl get pods -n karpenter-test -o wide
+
+# Check the status of your deployment
+kubectl get deployment -n karpenter-test karpenter-test
+
+#==========================================================
+# Test Different Instance Types
+#==========================================================
+
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: karpenter-test-large
+  namespace: karpenter-test
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: karpenter-test-large
+  template:
+    metadata:
+      labels:
+        app: karpenter-test-large
+    spec:
+      containers:
+      - name: karpenter-test
+        image: public.ecr.aws/amazonlinux/amazonlinux:2
+        command: ["sh", "-c", "while true; do echo Hello Karpenter; sleep 60; done"]
+        resources:
+          requests:
+            cpu: "4"
+            memory: "8Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+      tolerations:
+      - key: "karpenter.sh/disruption"
+        operator: "Exists"
+EOF
+
+#==========================================================
+# Test Node Consolidation
+#==========================================================
+
+Scale down the deployments to trigger node consolidation:
+
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: karpenter-test
+  namespace: karpenter-test
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: karpenter-test
+  template:
+    metadata:
+      labels:
+        app: karpenter-test
+    spec:
+      containers:
+      - name: karpenter-test
+        image: public.ecr.aws/amazonlinux/amazonlinux:2
+        command: ["sh", "-c", "while true; do echo Hello Karpenter; sleep 60; done"]
+        resources:
+          requests:
+            cpu: "1"
+            memory: "1Gi"
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+EOF
+
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: karpenter-test-large
+  namespace: karpenter-test
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: karpenter-test-large
+  template:
+    metadata:
+      labels:
+        app: karpenter-test-large
+    spec:
+      containers:
+      - name: karpenter-test
+        image: public.ecr.aws/amazonlinux/amazonlinux:2
+        command: ["sh", "-c", "while true; do echo Hello Karpenter; sleep 60; done"]
+        resources:
+          requests:
+            cpu: "4"
+            memory: "8Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+EOF
+
+Watch as Karpenter consolidates (removes) the now-empty nodes:
+
+kubectl get nodes -w
+
+#==========================================================
+# Test Spot Instance Interruption (Optional)
+#==========================================================
+
+cat <<EOF | kubectl apply -f -
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: karpenter-test-pdb
+  namespace: karpenter-test
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: karpenter-test
+EOF
+
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: karpenter-test
+  namespace: karpenter-test
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: karpenter-test
+  template:
+    metadata:
+      labels:
+        app: karpenter-test
+    spec:
+      containers:
+      - name: karpenter-test
+        image: public.ecr.aws/amazonlinux/amazonlinux:2
+        command: ["sh", "-c", "while true; do echo Hello Karpenter; sleep 60; done"]
+        resources:
+          requests:
+            cpu: "1"
+            memory: "1Gi"
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+      tolerations:
+      - key: "karpenter.sh/disruption"
+        operator: "Exists"
+EOF
+
+#==========================================================
+# Test Scaling with Load (Optional)
+#==========================================================
+
+cat <<EOF | kubectl apply -f -
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: karpenter-test-hpa
+  namespace: karpenter-test
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: karpenter-test
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50
+EOF
+
+Create a load generator:
+
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: load-generator
+  namespace: karpenter-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: load-generator
+  template:
+    metadata:
+      labels:
+        app: load-generator
+    spec:
+      containers:
+      - name: load-generator
+        image: busybox
+        command: 
+        - /bin/sh
+        - -c
+        - "while true; do dd if=/dev/zero of=/dev/null bs=1M count=1000; done"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "100Mi"
+          limits:
+            cpu: "100m"
+            memory: "100Mi"
+EOF
+
+#==========================================================
+# Analyze Karpenter Events
+#==========================================================
+
+# Get Karpenter events
+kubectl get events --sort-by='.lastTimestamp' | grep -i karpenter
+
+#==========================================================
+# Clean Up Test Resources
+#==========================================================
+
+cat <<EOF | kubectl delete -f -
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: karpenter-test
+EOF
+
+
+#==========================================================
+# Troubleshooting Commands
+#==========================================================
+
+# Check Karpenter logs
+kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter -c controller
+
+# Check pod events
+kubectl describe pods -n karpenter-test -l app=karpenter-test
+
+# Check NodePool status
+kubectl describe nodepool
+
+# Check EC2NodeClass status
+kubectl describe ec2nodeclass
+
+# Check node conditions
+kubectl describe nodes -l karpenter.sh/provisioner-name
+
