@@ -57,10 +57,6 @@ aws iam attach-role-policy \
   --role-name "${PREFIX}-karpenter-node-role" \
   --policy-arn "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 
-#==========================================================
-# Create the instance profile
-#==========================================================
-
 # Create the instance profile
 aws iam create-instance-profile \
   --instance-profile-name "${PREFIX}-karpenter-node-instance-profile"
@@ -139,11 +135,13 @@ aws iam put-role-policy \
   --policy-name "${PREFIX}-KarpenterControllerPolicy" \
   --policy-document file://~/karpenter/manifests/karpenter-controller-policy.json
 
+
 #==========================================================
 # Create the service-linked role for Spot instances
 #==========================================================
 
 aws iam create-service-linked-role --aws-service-name spot.amazonaws.com || true
+
 
 #==========================================================
 # Add tags to subnets and security groups
@@ -154,22 +152,26 @@ export VPC_ID=$(aws eks describe-cluster \
   --name ${CLUSTER_NAME} \
   --query "cluster.resourcesVpcConfig.vpcId" \
   --output text)
+echo VPC_ID=${VPC_ID}
 
 # Tag subnets
 for SUBNET in $(aws ec2 describe-subnets \
   --filters "Name=vpc-id,Values=${VPC_ID}" \
+            "Name=tag:Name,Values=${PREFIX}-private-*" \
   --query "Subnets[*].SubnetId" \
   --output text); do
+  echo SUBNET=${SUBNET}
   aws ec2 create-tags \
     --resources ${SUBNET} \
     --tags "Key=karpenter.sh/discovery,Value=${CLUSTER_NAME}"
 done
 
 # Tag security groups
-SECURITY_GROUP_ID=$(aws eks describe-cluster \
-  --name ${CLUSTER_NAME} \
-  --query "cluster.resourcesVpcConfig.clusterSecurityGroupId" \
+SECURITY_GROUP_ID=$(aws ec2 describe-security-groups \
+  --filters "Name=group-name,Values=${PREFIX}-eks-node-group" \
+  --query "SecurityGroups[0].GroupId" \
   --output text)
+echo "SECURITY_GROUP_ID=${SECURITY_GROUP_ID}"
 
 aws ec2 create-tags \
   --resources ${SECURITY_GROUP_ID} \
