@@ -1,27 +1,125 @@
-==========================================================
-# Create Environmental Variables
+#==========================================================
+# Set environment variables
 #==========================================================
 
 export ENV="dev"
 export PROJECT="ws-devops"
 export PREFIX="${ENV}-${PROJECT}"
 export CLUSTER_NAME="${PREFIX}-eks"
-export AWS_REGION="ap-northeast-1"
-export AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-export CLUSTER_ENDPOINT=$(aws eks describe-cluster --name ${CLUSTER_NAME} --query "cluster.endpoint" --output text)
-export KARPENTER_VERSION=v1.5.0
+export KARPENTER_NODE_ROLE_NAME="${PREFIX}-karpenter-node-role"
+export KARPENTER_NODE_INSTANCE_PROFILE_NAME="${PREFIX}-karpenter-node-instance-profile"
+export KARPENTER_CONTROLLER_IAM_ROLE_NAME="${PREFIX}-karpenter-controller-role"
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+export AWS_REGION=$(aws configure get region)
 
 #==========================================================
-# Create Directory
-#==========================================================
-mkdir -p ~/karpenter/manifests && cd ~/karpenter/manifests
-
-#==========================================================
-# Create the Node Role
+# Create Karpenter Controller Policy
 #==========================================================
 
-# Create the node IAM role
-cat <<EOF > ~/karpenter/manifests/node-trust-policy.json
+# Create the policy document
+cat > karpenter-controller-policy.json << 'EOF'
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ec2:CreateLaunchTemplate",
+                "ec2:CreateFleet",
+                "ec2:RunInstances",
+                "ec2:CreateTags",
+                "ec2:TerminateInstances",
+                "ec2:DeleteLaunchTemplate",
+                "ec2:DescribeLaunchTemplates",
+                "ec2:DescribeInstances",
+                "ec2:DescribeSecurityGroups",
+                "ec2:DescribeSubnets",
+                "ec2:DescribeInstanceTypes",
+                "ec2:DescribeInstanceTypeOfferings",
+                "ec2:DescribeAvailabilityZones",
+                "ec2:DescribeSpotPriceHistory",
+                "pricing:GetProducts",
+                "ssm:GetParameter",
+                "iam:PassRole",
+                "eks:DescribeCluster"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "sqs:DeleteMessage",
+                "sqs:GetQueueUrl",
+                "sqs:GetQueueAttributes",
+                "sqs:ReceiveMessage"
+            ],
+            "Resource": "arn:aws:sqs:*:*:*-karpenter"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "events:CreateRule",
+                "events:ListTargetsByRule",
+                "events:PutTargets"
+            ],
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "events:source": "aws.ec2",
+                    "events:detail-type": [
+                        "EC2 Instance State-change Notification",
+                        "EC2 Spot Instance Interruption Warning",
+                        "EC2 Instance Rebalance Recommendation"
+                    ]
+                }
+            }
+        }
+    ]
+}
+EOF
+
+# Create the IAM policy
+aws iam create-policy \
+    --policy-name "${PREFIX}-karpenter-controller-policy" \
+    --policy-document file://karpenter-controller-policy.json
+
+# Create the trust policy for the controller IAM role
+cat > karpenter-controller-trust-policy.json << EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/$(aws eks describe-cluster --name ${CLUSTER_NAME} --query "cluster.identity.oidc.issuer" --output text | sed 's|https://||')"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "$(aws eks describe-cluster --name ${CLUSTER_NAME} --query "cluster.identity.oidc.issuer" --output text | sed 's|https://||'):sub": "system:serviceaccount:karpenter:karpenter"
+        }
+      }
+    }
+  ]
+}
+EOF
+
+#==========================================================
+# Create Karpenter Controller Role
+#==========================================================
+
+# Create the controller IAM role
+aws iam create-role \
+    --role-name ${KARPENTER_CONTROLLER_IAM_ROLE_NAME} \
+    --assume-role-policy-document file://karpenter-controller-trust-policy.json
+
+# Attach the policy to the controller role
+aws iam attach-role-policy \
+    --role-name ${KARPENTER_CONTROLLER_IAM_ROLE_NAME} \
+    --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${PREFIX}-karpenter-controller-policy
+
+# Create the node role trust policy
+cat > ec2-trust-policy.json << 'EOF'
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -36,112 +134,46 @@ cat <<EOF > ~/karpenter/manifests/node-trust-policy.json
 }
 EOF
 
+#==========================================================
+# Create Karpenter Node Role(Karpenter Node Instance Profile)
+#==========================================================
+
+# Create the node role
 aws iam create-role \
-  --role-name "${PREFIX}-karpenter-node-role" \
-  --assume-role-policy-document file://~/karpenter/manifests/node-trust-policy.json
-
-# Attach required policies to the node role
-aws iam attach-role-policy \
-  --role-name "${PREFIX}-karpenter-node-role" \
-  --policy-arn "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
-
-aws iam attach-role-policy \
-  --role-name "${PREFIX}-karpenter-node-role" \
-  --policy-arn "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
-
-aws iam attach-role-policy \
-  --role-name "${PREFIX}-karpenter-node-role" \
-  --policy-arn "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
-
-aws iam attach-role-policy \
-  --role-name "${PREFIX}-karpenter-node-role" \
-  --policy-arn "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+    --role-name ${KARPENTER_NODE_ROLE_NAME} \
+    --assume-role-policy-document file://ec2-trust-policy.json
 
 # Create the instance profile
 aws iam create-instance-profile \
-  --instance-profile-name "${PREFIX}-karpenter-node-instance-profile"
+    --instance-profile-name ${KARPENTER_NODE_INSTANCE_PROFILE_NAME}
 
 # Add the role to the instance profile
 aws iam add-role-to-instance-profile \
-  --instance-profile-name "${PREFIX}-karpenter-node-instance-profile" \
-  --role-name "${PREFIX}-karpenter-node-role"
+    --instance-profile-name ${KARPENTER_NODE_INSTANCE_PROFILE_NAME} \
+    --role-name ${KARPENTER_NODE_ROLE_NAME}
 
-#==========================================================
-# Create the Controller Role
-#==========================================================
+# Attach required policies to the node role
+aws iam attach-role-policy \
+    --role-name ${KARPENTER_NODE_ROLE_NAME} \
+    --policy-arn arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
 
-# Get the OIDC provider URL for your cluster
-export OIDC_PROVIDER=$(aws eks describe-cluster --name ${CLUSTER_NAME} --query "cluster.identity.oidc.issuer" --output text | sed -e "s/^https:\/\///")
+aws iam attach-role-policy \
+    --role-name ${KARPENTER_NODE_ROLE_NAME} \
+    --policy-arn arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
 
-# Create the controller IAM role with OIDC trust relationship
-cat <<EOF > ~/karpenter/manifests/controller-trust-policy.json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {
-        "Federated": "arn:aws:iam::${AWS_ACCOUNT}:oidc-provider/${OIDC_PROVIDER}"
-      },
-      "Action": "sts:AssumeRoleWithWebIdentity",
-      "Condition": {
-        "StringEquals": {
-          "${OIDC_PROVIDER}:aud": "sts.amazonaws.com",
-          "${OIDC_PROVIDER}:sub": "system:serviceaccount:karpenter:karpenter"
-        }
-      }
-    }
-  ]
-}
-EOF
+aws iam attach-role-policy \
+    --role-name ${KARPENTER_NODE_ROLE_NAME} \
+    --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
 
-aws iam create-role \
-  --role-name "${PREFIX}-karpenter-controller-role" \
-  --assume-role-policy-document file://~/karpenter/manifests/controller-trust-policy.json
-
-# Create the controller policy
-cat <<EOF > karpenter-controller-policy.json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ec2:CreateLaunchTemplate",
-        "ec2:CreateFleet",
-        "ec2:RunInstances",
-        "ec2:CreateTags",
-        "iam:PassRole",
-        "ec2:TerminateInstances",
-        "ec2:DescribeLaunchTemplates",
-        "ec2:DescribeInstances",
-        "ec2:DescribeSecurityGroups",
-        "ec2:DescribeSubnets",
-        "ec2:DescribeInstanceTypes",
-        "ec2:DescribeInstanceTypeOfferings",
-        "ec2:DescribeAvailabilityZones",
-        "ec2:DescribeSpotPriceHistory",
-        "pricing:GetProducts",
-        "ssm:GetParameter"
-      ],
-      "Resource": "*"
-    }
-  ]
-}
-EOF
-
-aws iam put-role-policy \
-  --role-name "${PREFIX}-karpenter-controller-role" \
-  --policy-name "${PREFIX}-KarpenterControllerPolicy" \
-  --policy-document file://~/karpenter/manifests/karpenter-controller-policy.json
-
+aws iam attach-role-policy \
+    --role-name ${KARPENTER_NODE_ROLE_NAME} \
+    --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
 
 #==========================================================
 # Create the service-linked role for Spot instances
 #==========================================================
 
 aws iam create-service-linked-role --aws-service-name spot.amazonaws.com || true
-
 
 #==========================================================
 # Add tags to subnets and security groups
@@ -176,299 +208,3 @@ echo "SECURITY_GROUP_ID=${SECURITY_GROUP_ID}"
 aws ec2 create-tags \
   --resources ${SECURITY_GROUP_ID} \
   --tags "Key=karpenter.sh/discovery,Value=${CLUSTER_NAME}"
-
-#==========================================================
-# Create Kubernetes manifests for Karpenter
-#==========================================================
-
-# Create karpenter namespace
-kubectl create namespace karpenter
-
-# Download the CRDs
-curl -L "https://raw.githubusercontent.com/aws/karpenter/${KARPENTER_VERSION}/pkg/apis/crds/karpenter.sh_nodepools.yaml" > ~/karpenter/manifests/nodepool-crd.yaml
-curl -L "https://raw.githubusercontent.com/aws/karpenter/${KARPENTER_VERSION}/pkg/apis/crds/karpenter.k8s.aws_ec2nodeclasses.yaml" > ~/karpenter/manifests/ec2nodeclass-crd.yaml
-
-# Apply the CRDs
-kubectl apply -f ~/karpenter/manifests/nodepool-crd.yaml
-kubectl apply -f ~/karpenter/manifests/ec2nodeclass-crd.yaml
-
-#==========================================================
-# Create RBAC resources
-#==========================================================
-
-cat <<EOF | kubectl apply -f -
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: karpenter
-  namespace: karpenter
-  annotations:
-    eks.amazonaws.com/role-arn: "arn:aws:iam::${AWS_ACCOUNT}:role/${PREFIX}-karpenter-controller-role"
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: ${PREFIX}-karpenter
-rules:
-- apiGroups: [""]
-  resources: ["pods", "nodes", "persistentvolumes", "persistentvolumeclaims", "replicationcontrollers", "events"]
-  verbs: ["get", "list", "watch", "patch", "create", "delete", "update"]
-- apiGroups: ["apps"]
-  resources: ["daemonsets", "deployments", "replicasets", "statefulsets"]
-  verbs: ["list", "watch"]
-- apiGroups: ["storage.k8s.io"]
-  resources: ["storageclasses", "csinodes"]
-  verbs: ["get", "list", "watch"]
-- apiGroups: ["policy"]
-  resources: ["poddisruptionbudgets"]
-  verbs: ["list", "watch"]
-- apiGroups: ["karpenter.sh"]
-  resources: ["nodepools", "nodepools/status", "nodeclaims", "nodeclaims/status"]
-  verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
-- apiGroups: ["karpenter.k8s.aws"]
-  resources: ["ec2nodeclasses"]
-  verbs: ["get", "list", "watch"]
-- apiGroups: ["coordination.k8s.io"]
-  resources: ["leases"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: ${PREFIX}-karpenter
-subjects:
-- kind: ServiceAccount
-  name: karpenter
-  namespace: karpenter
-roleRef:
-  kind: ClusterRole
-  name: ${PREFIX}-karpenter
-  apiGroup: rbac.authorization.k8s.io
-EOF
-
-#==========================================================
-# Create Karpenter Controller Deployment
-#==========================================================
-
-cat <<EOF | kubectl apply -f -
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: ${PREFIX}-karpenter
-  namespace: karpenter
-  labels:
-    app.kubernetes.io/name: karpenter
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: karpenter
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: karpenter
-    spec:
-      serviceAccountName: karpenter
-      containers:
-      - name: controller
-        image: public.ecr.aws/karpenter/controller:${KARPENTER_VERSION}
-        imagePullPolicy: IfNotPresent
-        args:
-        - --health-probe-bind-address=:8081
-        - --metrics-bind-address=:8080
-        env:
-        - name: CLUSTER_NAME
-          value: ${CLUSTER_NAME}
-        - name: CLUSTER_ENDPOINT
-          value: ${CLUSTER_ENDPOINT}
-        - name: AWS_DEFAULT_INSTANCE_PROFILE
-          value: ${PREFIX}-karpenter-node-instance-profile
-        - name: AWS_ENI_LIMITED_POD_DENSITY
-          value: "true"
-        - name: AWS_REGION
-          value: ${AWS_REGION}
-        ports:
-        - containerPort: 8080
-          name: http-metrics
-        - containerPort: 8081
-          name: http-health
-        livenessProbe:
-          httpGet:
-            path: /healthz
-            port: http-health
-          initialDelaySeconds: 10
-          periodSeconds: 30
-        readinessProbe:
-          httpGet:
-            path: /readyz
-            port: http-health
-          initialDelaySeconds: 10
-          periodSeconds: 30
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - ALL
-          readOnlyRootFilesystem: true
-          runAsNonRoot: true
-          runAsUser: 1000
-          seccompProfile:
-            type: RuntimeDefault
-        resources:
-          limits:
-            cpu: 1
-            memory: 1Gi
-          requests:
-            cpu: 200m
-            memory: 512Mi
-      - name: webhook
-        image: public.ecr.aws/karpenter/controller:${KARPENTER_VERSION}
-        imagePullPolicy: IfNotPresent
-        args:
-        - --webhook-bind-address=:8443
-        env:
-        - name: CLUSTER_NAME
-          value: ${CLUSTER_NAME}
-        - name: CLUSTER_ENDPOINT
-          value: ${CLUSTER_ENDPOINT}
-        - name: AWS_DEFAULT_INSTANCE_PROFILE
-          value: ${PREFIX}-karpenter-node-instance-profile
-        - name: AWS_ENI_LIMITED_POD_DENSITY
-          value: "true"
-        - name: AWS_REGION
-          value: ${AWS_REGION}
-        ports:
-        - containerPort: 8443
-          name: https-webhook
-        livenessProbe:
-          httpGet:
-            path: /healthz
-            port: https-webhook
-            scheme: HTTPS
-          initialDelaySeconds: 10
-          periodSeconds: 30
-        readinessProbe:
-          httpGet:
-            path: /readyz
-            port: https-webhook
-            scheme: HTTPS
-          initialDelaySeconds: 10
-          periodSeconds: 30
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - ALL
-          readOnlyRootFilesystem: true
-          runAsNonRoot: true
-          runAsUser: 1000
-          seccompProfile:
-            type: RuntimeDefault
-        resources:
-          limits:
-            cpu: 500m
-            memory: 500Mi
-          requests:
-            cpu: 100m
-            memory: 256Mi
-      securityContext:
-        fsGroup: 1000
-EOF
-
-#==========================================================
-# Create Karpenter Controller Service
-#==========================================================
-
-cat <<EOF | kubectl apply -f -
-apiVersion: v1
-kind: Service
-metadata:
-  name: ${PREFIX}-karpenter
-  namespace: karpenter
-  labels:
-    app.kubernetes.io/name: karpenter
-spec:
-  ports:
-  - port: 443
-    targetPort: 8443
-    protocol: TCP
-    name: https-webhook
-  selector:
-    app.kubernetes.io/name: karpenter
-EOF
-
-#==========================================================
-# Create Karpenter Webhook Configuration
-#==========================================================
-
-cat <<EOF | kubectl apply -f -
-apiVersion: admissionregistration.k8s.io/v1
-kind: MutatingWebhookConfiguration
-metadata:
-  name: ${PREFIX}-karpenter
-webhooks:
-- admissionReviewVersions:
-  - v1
-  clientConfig:
-    service:
-      name: ${PREFIX}-karpenter
-      namespace: karpenter
-      path: /mutate
-  failurePolicy: Fail
-  name: defaulting.webhook.karpenter.sh
-  rules:
-  - apiGroups:
-    - karpenter.sh
-    apiVersions:
-    - v1alpha5
-    - v1beta1
-    operations:
-    - CREATE
-    - UPDATE
-    resources:
-    - nodepools
-    - nodeclaims
-  sideEffects: None
----
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingWebhookConfiguration
-metadata:
-  name: ${PREFIX}-karpenter
-webhooks:
-- admissionReviewVersions:
-  - v1
-  clientConfig:
-    service:
-      name: ${PREFIX}-karpenter
-      namespace: karpenter
-      path: /validate
-  failurePolicy: Fail
-  name: validation.webhook.karpenter.sh
-  rules:
-  - apiGroups:
-    - karpenter.sh
-    apiVersions:
-    - v1alpha5
-    - v1beta1
-    operations:
-    - CREATE
-    - UPDATE
-    resources:
-    - nodepools
-    - nodeclaims
-  sideEffects: None
-EOF
-
-#==========================================================
-# Verification Karpenter Object
-#==========================================================
-
-# Check that Karpenter pods are running
-kubectl get pods -n karpenter
-
-# Check Karpenter logs
-kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter -c controller
-
-# Check that the webhook is working
-kubectl get mutatingwebhookconfigurations ${PREFIX}-karpenter
-kubectl get validatingwebhookconfigurations ${PREFIX}-karpenter
