@@ -62,7 +62,7 @@ metadata:
   namespace: node-drain-monitor
 type: Opaque
 stringData:
-  webhook-url: "https://hooks.slack.com/services/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"
+  webhook-url: "https://hooks.slack.com/services/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"
 EOF
 
 #==========================================================
@@ -94,6 +94,7 @@ spec:
         - -c
         - |
           pip install kubernetes requests
+          mkdir /app
           cat > /app/monitor.py << 'EOF_PYTHON'
           from kubernetes import client, config, watch
           import requests
