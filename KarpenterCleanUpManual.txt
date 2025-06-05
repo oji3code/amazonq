@@ -9,7 +9,7 @@ export CLUSTER_NAME="${PREFIX}-eks"
 export AWS_REGION="ap-northeast-1"
 export AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 export CLUSTER_ENDPOINT=$(aws eks describe-cluster --name ${CLUSTER_NAME} --query "cluster.endpoint" --output text)
-export KARPENTER_VERSION=v0.27.5
+export KARPENTER_VERSION=v1.50.0
 
 #==========================================================
 # Delete NodePool and EC2NodeClass Resources
@@ -78,42 +78,42 @@ kubectl delete crd nodeclaims.karpenter.sh
 
 # Detach policies from the node role
 aws iam detach-role-policy \
-  --role-name "${PREFIX}-KarpenterNodeRole" \
+  --role-name "${PREFIX}-karpenter-node-role" \
   --policy-arn "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
 
 aws iam detach-role-policy \
-  --role-name "${PREFIX}-KarpenterNodeRole" \
+  --role-name "${PREFIX}-karpenter-node-role" \
   --policy-arn "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
 
 aws iam detach-role-policy \
-  --role-name "${PREFIX}-KarpenterNodeRole" \
+  --role-name "${PREFIX}-karpenter-node-role" \
   --policy-arn "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
 
 aws iam detach-role-policy \
-  --role-name "${PREFIX}-KarpenterNodeRole" \
+  --role-name "${PREFIX}-karpenter-node-role" \
   --policy-arn "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 
 # Remove the role from the instance profile
 aws iam remove-role-from-instance-profile \
-  --instance-profile-name "${PREFIX}-KarpenterNodeInstanceProfile" \
-  --role-name "${PREFIX}-KarpenterNodeRole"
+  --instance-profile-name "${PREFIX}-karpenter-node-instance-profile" \
+  --role-name "${PREFIX}-karpenter-node-role"
 
 # Delete the instance profile
 aws iam delete-instance-profile \
-  --instance-profile-name "${PREFIX}-KarpenterNodeInstanceProfile"
+  --instance-profile-name "${PREFIX}-karpenter-node-instance-profile"
 
 # Delete the node role
 aws iam delete-role \
-  --role-name "${PREFIX}-KarpenterNodeRole"
+  --role-name "${PREFIX}-karpenter-node-role"
 
 # Delete the controller policy
 aws iam delete-role-policy \
-  --role-name "${PREFIX}-KarpenterControllerRole" \
-  --policy-name "${PREFIX}-KarpenterControllerPolicy"
+  --role-name "${PREFIX}-karpenter-controller-role" \
+  --policy-name "${PREFIX}-karpenter-controller-policy"
 
 # Delete the controller role
 aws iam delete-role \
-  --role-name "${PREFIX}-KarpenterControllerRole"
+  --role-name "${PREFIX}-karpenter-controller-role"
 
 #==========================================================
 # Remove Tags from AWS Resources
