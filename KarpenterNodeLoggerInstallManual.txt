@@ -1,0 +1,210 @@
+#==========================================================
+# Create Namespace
+#==========================================================
+
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: karpenter-node-logger
+EOF
+
+#==========================================================
+# Create SA, Role, ClusterRoleBinding
+#==========================================================
+
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: karpenter-node-logger
+  namespace: karpenter-node-logger
+EOF
+
+cat <<EOF | kubectl apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: karpenter-node-logger # 任意でわかりやすい名前に変更可能
+rules:
+- apiGroups: ["karpenter.sh"] # NodeClaimリソースのAPIグループ
+  resources: ["nodeclaims"] # 監視したいリソース
+  verbs: ["get", "list", "watch"] # 取得、一覧表示、監視の権限を付与
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: karpenter-node-logger-binding # 任意でわかりやすい名前に変更可能
+subjects:
+- kind: ServiceAccount
+  name: karpenter-node-logger # エラーメッセージに表示されたサービスアカウント名
+  namespace: karpenter-node-logger # エラーメッセージに表示されたサービスアカウントの名前空間
+roleRef:
+  kind: ClusterRole
+  name: karpenter-node-logger # 上記で作成したClusterRoleの名前
+  apiGroup: rbac.authorization.k8s.ioEOF
+EOF
+
+#==========================================================
+# Create Deployment(Python App: Monitor for Kubernetes's Event of Node)
+#==========================================================
+
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: karpenter-node-logger
+  namespace: karpenter-node-logger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: karpenter-node-logger
+  template:
+    metadata:
+      labels:
+        app: karpenter-node-logger
+    spec:
+      serviceAccountName: karpenter-node-logger
+      containers:
+      - name: monitor
+        image: python:3.9-slim
+        command:
+        - /bin/bash
+        - -c
+        - |
+          pip install kubernetes requests > /dev/null 2>&1
+          mkdir /app
+          cat > /app/monitor.py << 'EOF_PYTHON'
+          from kubernetes import client, config, watch
+          import os
+          import time
+
+          def detect_karpenter_scale_in():
+            # kubeconfig を読み込む (開発環境/ローカル実行用)
+            # Pod内で実行する場合は config.load_incluster_config() を使用
+            try:
+              config.load_kube_config()
+            except config.ConfigException:
+              print("Falling back to in-cluster config...")
+              config.load_incluster_config()
+
+            # KarpenterのCustom Resource Definition (CRD) のAPIグループとバージョン
+            api_version = "karpenter.sh/v1"
+            kind = "NodeClaim"
+
+            print(f"Watching for {kind} changes in API version {api_version}...")
+
+            # カスタムオブジェクトAPIクライアントの初期化
+            custom_api = client.CustomObjectsApi()
+            # コアAPIクライアントの初期化 (Nodeリソース取得用)
+            core_api = client.CoreV1Api()
+
+            # watch オブジェクトの初期化
+            w = watch.Watch()
+
+            # NodeClaimリソースの変更を監視
+            for event in w.stream(custom_api.list_cluster_custom_object,
+                                  group="karpenter.sh",
+                                  version="v1",
+                                  plural="nodeclaims"):
+              
+              event_type = event['type']
+              nodeclaim_name = event['object']['metadata']['name']
+              node_name = event['object'].get('status', {}).get('nodeName') # NodeClaimからnodeNameを取得
+              
+              # NodeClaim オブジェクト全体
+              nodeclaim = event['object']
+
+              # インスタンスIDの取得
+              instance_id = None
+              provider_id = nodeclaim.get('status', {}).get('providerID')
+              if provider_id:
+                # providerIDは通常 "aws:///availability-zone/i-xxxxxxxxxxxxxxxxx" の形式
+                # インスタンスIDは最後のスラッシュ以降の部分
+                instance_id = provider_id.split('/')[-1]
+
+              # ノードIPアドレスの取得
+              node_ip_address = None
+              if node_name:
+                try:
+                  # Kubernetes Node リソースを取得
+                  node_obj = core_api.read_node(name=node_name)
+                  for address in node_obj.status.addresses:
+                    if address.type == 'InternalIP':
+                      node_ip_address = address.address
+                      break
+                except client.ApiException as e:
+                  # ノードが見つからない、または権限がない場合
+                  print(f"  Warning: Could not get Node details for {node_name}: {e}")
+                  # Scale-in中の場合、Nodeが既に削除されている可能性があるため、エラーは必ずしも問題ではない
+
+              # NodeClaim の現在の理由 (Reason) を取得
+              reason = None
+              for condition in nodeclaim.get('status', {}).get('conditions', []):
+                if condition.get('type') == 'Disrupting' and condition.get('status') == 'True':
+                  reason = "Disrupting"
+                  break
+              
+              # ログメッセージ
+              log_message = f"Event: {event_type} on NodeClaim: {nodeclaim_name}"
+
+              if node_name:
+                log_message += f", Node: {node_name}"
+              if instance_id:
+                log_message += f", Instance ID: {instance_id}"
+              if node_ip_address:
+                log_message += f", IP: {node_ip_address}"
+              if reason:
+                log_message += f", Current Reason: {reason}"
+              
+              # Scale In イベントの検知ロジック
+              if event_type == 'DELETED':
+                print(f"--- DETECTED SCALE-IN (NodeClaim DELETED): {nodeclaim_name} ---")
+                # ここに通知ロジックなどを追加
+                # 削除されたノードの情報を含める
+                print(f"    Node Name: {node_name}, Instance ID: {instance_id}, IP: {node_ip_address}")
+              elif event_type == 'MODIFIED':
+                if reason == "Disrupting":
+                  print(f"--- DETECTED SCALE-IN (NodeClaim DISRUPTING): {nodeclaim_name} ---")
+                  # 終了プロセス中のノードの情報を含める
+                  print(f"    Node Name: {node_name}, Instance ID: {instance_id}, IP: {node_ip_address}")
+              
+              print(log_message)
+
+          if __name__ == "__main__":
+            detect_karpenter_scale_in()
+          EOF_PYTHON
+          
+          python /app/monitor.py
+        env:
+        - name: SLACK_WEBHOOK_URL
+          valueFrom:
+            secretKeyRef:
+              name: slack-webhook
+              key: webhook-url
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+EOF
+
+#==========================================================
+# Verify Pod
+#==========================================================
+
+kubectl get pods -n karpenter-node-logger
+
+kubectl logs -n karpenter-node-logger $(kubectl get po -n karpenter-node-logger -o jsonpath={.items[0].metadata.name}) 
+
+#==========================================================
+# Node cordon
+#==========================================================
+
+kubectl cordon ip-10-0-3-81.ap-northeast-1.compute.internal
+kubectl uncordon ip-10-0-3-81.ap-northeast-1.compute.internal
+
