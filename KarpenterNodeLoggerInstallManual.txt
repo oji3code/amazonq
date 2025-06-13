@@ -1,4 +1,18 @@
 #==========================================================
+# Helm install
+#==========================================================
+
+helm repo add datadog https://helm.datadoghq.com
+helm repo update
+
+helm upgrade datadog-agent datadog/datadog \
+  --set datadogApiKey=<YOUR_DATADOG_API_KEY> \
+  --set datadogAppKey=<YOUR_DATADOG_APP_KEY> \
+  --set logs.enabled=true \
+  --set containerRuntime.cri.enabled=true
+
+
+#==========================================================
 # Create Namespace
 #==========================================================
 
@@ -65,6 +79,8 @@ spec:
     metadata:
       labels:
         app: karpenter-node-logger
+		  annotations:
+		    ad.datadoghq.com/my-app.logs: '[{"source": "karpenter-node-logger", "service": "nodeclaims-watcher"}]'
     spec:
       serviceAccountName: karpenter-node-logger
       containers:
@@ -200,11 +216,3 @@ EOF
 kubectl get pods -n karpenter-node-logger
 
 kubectl logs -n karpenter-node-logger $(kubectl get po -n karpenter-node-logger -o jsonpath={.items[0].metadata.name}) 
-
-#==========================================================
-# Node cordon
-#==========================================================
-
-kubectl cordon ip-10-0-3-81.ap-northeast-1.compute.internal
-kubectl uncordon ip-10-0-3-81.ap-northeast-1.compute.internal
-
