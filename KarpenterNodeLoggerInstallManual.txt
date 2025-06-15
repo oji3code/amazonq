@@ -44,8 +44,9 @@ rules:
 - apiGroups: ["karpenter.sh"] # NodeClaimリソースのAPIグループ
   resources: ["nodeclaims"] # 監視したいリソース
   verbs: ["get", "list", "watch"] # 取得、一覧表示、監視の権限を付与
+EOF
 
----
+cat <<EOF | kubectl apply -f -
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -57,7 +58,7 @@ subjects:
 roleRef:
   kind: ClusterRole
   name: karpenter-node-logger # 上記で作成したClusterRoleの名前
-  apiGroup: rbac.authorization.k8s.ioEOF
+  apiGroup: rbac.authorization.k8s.io
 EOF
 
 #==========================================================
@@ -79,8 +80,8 @@ spec:
     metadata:
       labels:
         app: karpenter-node-logger
-		  annotations:
-		    ad.datadoghq.com/my-app.logs: '[{"source": "karpenter-node-logger", "service": "nodeclaims-watcher"}]'
+      annotations:
+        ad.datadoghq.com/my-app.logs: '[{"source": "python", "service": "karpenter-node-logger"}]'
     spec:
       serviceAccountName: karpenter-node-logger
       containers:
@@ -92,12 +93,12 @@ spec:
         - |
           pip install kubernetes requests > /dev/null 2>&1
           mkdir /app
-          cat > /app/monitor.py << 'EOF_PYTHON'
+          cat > /app/karpenter-node-logger.py << 'EOF_PYTHON'
           from kubernetes import client, config, watch
           import os
           import time
 
-          def detect_karpenter_scale_in():
+          def logging_karpenter_node_scale():
             # kubeconfig を読み込む (開発環境/ローカル実行用)
             # Pod内で実行する場合は config.load_incluster_config() を使用
             try:
@@ -190,16 +191,10 @@ spec:
               print(log_message)
 
           if __name__ == "__main__":
-            detect_karpenter_scale_in()
+            logging_karpenter_node_scale()
           EOF_PYTHON
           
-          python /app/monitor.py
-        env:
-        - name: SLACK_WEBHOOK_URL
-          valueFrom:
-            secretKeyRef:
-              name: slack-webhook
-              key: webhook-url
+          python /app/karpenter-node-logger.py
         resources:
           requests:
             memory: "128Mi"
