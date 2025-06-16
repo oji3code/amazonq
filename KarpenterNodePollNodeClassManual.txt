@@ -10,303 +10,65 @@ export CLUSTER_NAME="${PREFIX}-eks"
 #==========================================================
 # Create Karpenter NodePool
 #==========================================================
-cat <<EOF | kubectl apply -f -
-apiVersion: karpenter.sh/v1beta1
+cat << EOF | kubectl apply -f -
+apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
-  name: ${PREFIX}-default
+  name: default
 spec:
   template:
     spec:
       nodeClassRef:
-        name: ${PREFIX}-default
-      # Define requirements for the nodes
+        name: default
+        kind: EC2NodeClass
+        group: karpenter.k8s.aws
       requirements:
-        # Use spot instances for cost savings
-        - key: karpenter.sh/capacity-type
-          operator: In
-          values: ["spot"]
-        
-        # Specify allowed instance types
-        - key: node.kubernetes.io/instance-type
-          operator: In
-          values:
-            - t3.medium
-            - t3.large
-            - m5.large
-            - m5.xlarge
-        
-        # Specify architecture
         - key: kubernetes.io/arch
           operator: In
           values: ["amd64"]
-        
-        # Specify OS
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot"]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values:
+            - t3.micro
+            - t3.small
         - key: kubernetes.io/os
           operator: In
           values: ["linux"]
-        
-        # Specify availability zones
         - key: topology.kubernetes.io/zone
           operator: In
-          values: ["${AWS_REGION}a", "${AWS_REGION}b", "${AWS_REGION}c"]
-  
-  # Set resource limits for this NodePool
-  limits:
-    resources:
-      cpu: 100       # Maximum 100 CPU cores across all nodes
-      memory: 400Gi  # Maximum 400 GiB memory across all nodes
-  
-  # Configure disruption settings
-  disruption:
-    # Consolidate nodes when they're underutilized
-    consolidationPolicy: WhenUnderutilized
-    
-    # Wait 30 seconds before consolidating
-    consolidateAfter: 30s
-    
-    # Set node expiration time (24 hours)
-    expireAfter: 24h
+          values: ["ap-northeast-1a","ap-northeast-1c","ap-northeast-1d"]
 EOF
 
 #==========================================================
 # Create Karpenter EC2 Node Class
 #==========================================================
 
-cat <<EOF | kubectl apply -f -
-apiVersion: karpenter.k8s.aws/v1beta1
+cat << EOF | kubectl apply -f -
+apiVersion: karpenter.k8s.aws/v1
 kind: EC2NodeClass
 metadata:
-  name: ${PREFIX}-default
+  name: default
 spec:
-  # Specify the AMI family to use
-  amiFamily: AL2  # Amazon Linux 2
-  
-  # Reference the IAM role created earlier
-  role: ${PREFIX}-KarpenterNodeRole
-  
-  # Select subnets using the tags we applied
-  subnetSelector:
-    karpenter.sh/discovery: ${CLUSTER_NAME}
-  
-  # Select security groups using the tags we applied
-  securityGroupSelector:
-    karpenter.sh/discovery: ${CLUSTER_NAME}
-  
-  # Configure block device mappings
-  blockDeviceMappings:
-    - deviceName: /dev/xvda
-      ebs:
-        volumeSize: 50Gi
-        volumeType: gp3
-        encrypted: true
-  
-  # Add tags to the EC2 instances
-  tags:
-    Name: ${PREFIX}-karpenter-node
-    Environment: dev
-    ManagedBy: karpenter
-EOF
-
-#==========================================================
-# Multi-Architecture Support
-#==========================================================
-
-cat <<EOF | kubectl apply -f -
-apiVersion: karpenter.sh/v1beta1
-kind: NodePool
-metadata:
-  name: ${PREFIX}-multi-arch
-spec:
-  template:
-    spec:
-      nodeClassRef:
-        name: ${PREFIX}-default
-      requirements:
-        - key: kubernetes.io/arch
-          operator: In
-          values: ["amd64", "arm64"]
-        - key: kubernetes.io/os
-          operator: In
-          values: ["linux"]
-        - key: karpenter.sh/capacity-type
-          operator: In
-          values: ["spot", "on-demand"]
-  disruption:
-    consolidationPolicy: WhenUnderutilized
-    consolidateAfter: 30s
-EOF
-
-#==========================================================
-# GPU Workloads
-#==========================================================
-
-cat <<EOF | kubectl apply -f -
-apiVersion: karpenter.sh/v1beta1
-kind: NodePool
-metadata:
-  name: ${PREFIX}-gpu
-spec:
-  template:
-    spec:
-      nodeClassRef:
-        name: ${PREFIX}-gpu
-      requirements:
-        - key: node.kubernetes.io/instance-type
-          operator: In
-          values:
-            - g4dn.xlarge
-            - g4dn.2xlarge
-            - g5.xlarge
-        - key: karpenter.k8s.aws/accelerator-count
-          operator: Gt
-          values: ["0"]
-        - key: karpenter.k8s.aws/accelerator-manufacturer
-          operator: In
-          values: ["nvidia"]
-  disruption:
-    consolidationPolicy: WhenEmpty
-    consolidateAfter: 30s
-EOF
-
-#==========================================================
-# Memory-Optimized Workloads
-#==========================================================
-
-cat <<EOF | kubectl apply -f -
-apiVersion: karpenter.sh/v1beta1
-kind: NodePool
-metadata:
-  name: ${PREFIX}-memory
-spec:
-  template:
-    spec:
-      nodeClassRef:
-        name: ${PREFIX}-default
-      requirements:
-        - key: karpenter.k8s.aws/instance-family
-          operator: In
-          values: ["r5", "r6g", "r6i", "x2gd"]
-        - key: karpenter.k8s.aws/instance-memory
-          operator: Gt
-          values: ["32Gi"]
-  disruption:
-    consolidationPolicy: WhenUnderutilized
-    consolidateAfter: 30s
-EOF
-
-#==========================================================
-# Startup Taints
-#==========================================================
-
-cat <<EOF | kubectl apply -f -
-apiVersion: karpenter.sh/v1beta1
-kind: NodePool
-metadata:
-  name: ${PREFIX}-with-taints
-spec:
-  template:
-    spec:
-      nodeClassRef:
-        name: ${PREFIX}-default
-      requirements:
-        - key: kubernetes.io/arch
-          operator: In
-          values: ["amd64"]
-        - key: kubernetes.io/os
-          operator: In
-          values: ["linux"]
-      # Add startup taints
-      startupTaints:
-        - key: node.kubernetes.io/not-ready
-          effect: NoSchedule
-  disruption:
-    consolidationPolicy: WhenUnderutilized
-    consolidateAfter: 30s
-EOF
-
-#==========================================================
-# Custom AMI
-#==========================================================
-
-cat <<EOF | kubectl apply -f -
-apiVersion: karpenter.k8s.aws/v1beta1
-kind: EC2NodeClass
-metadata:
-  name: ${PREFIX}-custom-ami
-spec:
-  # Use a custom AMI
+  kubelet:
+    maxPods: 20
+    clusterDNS: ["10.100.0.10"]
+  amiFamily: "AL2023"
+  subnetSelectorTerms:
+    - tags:
+        "karpenter.sh/discovery": dev-ws-devops-eks
+  securityGroupSelectorTerms:
+    - tags:
+        "karpenter.sh/discovery": dev-ws-devops-eks
+  instanceProfile: "dev-ws-devops-karpenter-node-instance-profile"
   amiSelectorTerms:
-    - id: ami-0123456789abcdef0  # Replace with your AMI ID
-  
-  role: ${PREFIX}-KarpenterNodeRole
-  subnetSelector:
-    karpenter.sh/discovery: ${CLUSTER_NAME}
-  securityGroupSelector:
-    karpenter.sh/discovery: ${CLUSTER_NAME}
-  
-  # Configure user data for custom AMI
-  userData: |
-    #!/bin/bash
-    echo "Custom initialization script"
-    /etc/eks/bootstrap.sh ${CLUSTER_NAME}
-EOF
-
-#==========================================================
-# Instance Store Volumes(Create an EC2NodeClass that utilizes instance store volumes:)
-#==========================================================
-
-cat <<EOF | kubectl apply -f -
-apiVersion: karpenter.k8s.aws/v1beta1
-kind: EC2NodeClass
-metadata:
-  name: ${PREFIX}-instance-store
-spec:
-  amiFamily: AL2
-  
-  role: ${PREFIX}-KarpenterNodeRole
-  subnetSelector:
-    karpenter.sh/discovery: ${CLUSTER_NAME}
-  securityGroupSelector:
-    karpenter.sh/discovery: ${CLUSTER_NAME}
-  
-  # Configure instance store policy
-  instanceStorePolicy: RAID0
-  
-  # Only select instance types with instance stores
-  instanceRequirements:
-    - key: karpenter.k8s.aws/instance-local-nvme
-      operator: Gt
-      values: ["0"]
-EOF
-
-#==========================================================
-# Enhanced Networking and Detailed Monitoring(Create an EC2NodeClass with enhanced networking and detailed monitoring:)
-#==========================================================
-
-cat <<EOF | kubectl apply -f -
-apiVersion: karpenter.k8s.aws/v1beta1
-kind: EC2NodeClass
-metadata:
-  name: ${PREFIX}-enhanced
-spec:
-  amiFamily: AL2
-  
-  role: ${PREFIX}-KarpenterNodeRole
-  subnetSelector:
-    karpenter.sh/discovery: ${CLUSTER_NAME}
-  securityGroupSelector:
-    karpenter.sh/discovery: ${CLUSTER_NAME}
-  
-  # Enable detailed monitoring
-  detailedMonitoring: true
-  
-  # Configure metadata options for security
-  metadataOptions:
-    httpEndpoint: enabled
-    httpProtocolIPv6: disabled
-    httpPutResponseHopLimit: 2
-    httpTokens: required
+    - name: "amazon-eks-node-al2023-x86_64-standard-1.33-v20250*"
+      owner: "602401143452"
+  tags:
+    Name:  "karpenter-node/dev-ws-devops-eks"
+    prefix:  "dev-ws-devops"
 EOF
 
 #==========================================================
@@ -320,10 +82,10 @@ kubectl get nodepool
 kubectl get ec2nodeclass
 
 # Describe a NodePool for details
-kubectl describe nodepool ${PREFIX}-default
+kubectl describe nodepool default
 
 # Describe an EC2NodeClass for details
-kubectl describe ec2nodeclass ${PREFIX}-default
+kubectl describe ec2nodeclass default
 
 #==========================================================
 # Troubleshooting
@@ -333,10 +95,10 @@ kubectl describe ec2nodeclass ${PREFIX}-default
 kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter -c controller
 
 # Check for events related to your NodePool
-kubectl describe nodepool ${PREFIX}-default | grep -A 10 Events:
+kubectl describe nodepool default | grep -A 10 Events:
 
 # Check for events related to your EC2NodeClass
-kubectl describe ec2nodeclass ${PREFIX}-default | grep -A 10 Events:
+kubectl describe ec2nodeclass default | grep -A 10 Events:
 
 # Check if nodes are being provisioned
-kubectl get nodes -l karpenter.sh/nodepool=${PREFIX}-default
+kubectl get nodes -l karpenter.sh/nodepool=default
