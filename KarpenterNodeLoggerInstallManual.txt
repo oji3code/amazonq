@@ -5,12 +5,18 @@
 helm repo add datadog https://helm.datadoghq.com
 helm repo update
 
-helm upgrade datadog-agent datadog/datadog \
-  --set datadogApiKey=<YOUR_DATADOG_API_KEY> \
-  --set datadogAppKey=<YOUR_DATADOG_APP_KEY> \
-  --set logs.enabled=true \
-  --set containerRuntime.cri.enabled=true
+kubectl create secret generic datadog-secret --from-literal api-key=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 
+cat << EOF > datadog-values.yaml
+datadog:
+  site: "ap1.datadoghq.com"
+  apiKeyExistingSecret: "datadog-secret"
+  logs:
+    enabled: true
+    containerCollectAll: true
+EOF
+
+helm install datadog-agent -f datadog-values.yaml datadog/datadog
 
 #==========================================================
 # Create Namespace
@@ -41,6 +47,9 @@ kind: ClusterRole
 metadata:
   name: karpenter-node-logger # 任意でわかりやすい名前に変更可能
 rules:
+- apiGroups: [""] # "" はコアAPIグループ（ノードなど）を示す
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"] # get だけでなく、list と watch もあると良い
 - apiGroups: ["karpenter.sh"] # NodeClaimリソースのAPIグループ
   resources: ["nodeclaims"] # 監視したいリソース
   verbs: ["get", "list", "watch"] # 取得、一覧表示、監視の権限を付与
@@ -81,11 +90,17 @@ spec:
       labels:
         app: karpenter-node-logger
       annotations:
-        ad.datadoghq.com/my-app.logs: '[{"source": "python", "service": "karpenter-node-logger"}]'
+        ad.datadoghq.com/karpenter-node-logger.logs: |-
+          [
+            {
+              "source": "python",
+              "service": "karpenter"
+            }
+          ]
     spec:
       serviceAccountName: karpenter-node-logger
       containers:
-      - name: monitor
+      - name: karpenter-node-logger
         image: python:3.9-slim
         command:
         - /bin/bash
@@ -95,101 +110,89 @@ spec:
           mkdir /app
           cat > /app/karpenter-node-logger.py << 'EOF_PYTHON'
           from kubernetes import client, config, watch
-          import os
-          import time
+          import logging
+          # DEBUGレベルのログもDatadogに送りたい場合は logging.DEBUG に変更
+          logging.basicConfig(level=logging.INFO,
+                              format='%(message)s') # タイムスタンプを削除
+
+          logger = logging.getLogger('karpenter-node-logger')
 
           def logging_karpenter_node_scale():
-            # kubeconfig を読み込む (開発環境/ローカル実行用)
-            # Pod内で実行する場合は config.load_incluster_config() を使用
             try:
               config.load_kube_config()
             except config.ConfigException:
-              print("Falling back to in-cluster config...")
+              # Pod内で実行する場合は in-cluster config にフォールバック
+              logger.info("Falling back to in-cluster config...")
               config.load_incluster_config()
 
-            # KarpenterのCustom Resource Definition (CRD) のAPIグループとバージョン
-            api_version = "karpenter.sh/v1"
-            kind = "NodeClaim"
-
-            print(f"Watching for {kind} changes in API version {api_version}...")
-
-            # カスタムオブジェクトAPIクライアントの初期化
-            custom_api = client.CustomObjectsApi()
-            # コアAPIクライアントの初期化 (Nodeリソース取得用)
             core_api = client.CoreV1Api()
-
-            # watch オブジェクトの初期化
             w = watch.Watch()
+            custom_api = client.CustomObjectsApi()
 
-            # NodeClaimリソースの変更を監視
+            logger.debug("Starting to watch NodeClaims for scale events...")
+
             for event in w.stream(custom_api.list_cluster_custom_object,
-                                  group="karpenter.sh",
-                                  version="v1",
-                                  plural="nodeclaims"):
+                                    group="karpenter.sh",
+                                    version="v1",
+                                    plural="nodeclaims"):
               
-              event_type = event['type']
-              nodeclaim_name = event['object']['metadata']['name']
-              node_name = event['object'].get('status', {}).get('nodeName') # NodeClaimからnodeNameを取得
-              
-              # NodeClaim オブジェクト全体
               nodeclaim = event['object']
-
-              # インスタンスIDの取得
+              event_type = event['type']
+              nodeclaim_name = nodeclaim['metadata']['name']
+              node_name = nodeclaim.get('status', {}).get('nodeName')
+              
               instance_id = None
               provider_id = nodeclaim.get('status', {}).get('providerID')
               if provider_id:
-                # providerIDは通常 "aws:///availability-zone/i-xxxxxxxxxxxxxxxxx" の形式
-                # インスタンスIDは最後のスラッシュ以降の部分
                 instance_id = provider_id.split('/')[-1]
 
-              # ノードIPアドレスの取得
               node_ip_address = None
               if node_name:
                 try:
-                  # Kubernetes Node リソースを取得
                   node_obj = core_api.read_node(name=node_name)
                   for address in node_obj.status.addresses:
                     if address.type == 'InternalIP':
                       node_ip_address = address.address
                       break
                 except client.ApiException as e:
-                  # ノードが見つからない、または権限がない場合
-                  print(f"  Warning: Could not get Node details for {node_name}: {e}")
-                  # Scale-in中の場合、Nodeが既に削除されている可能性があるため、エラーは必ずしも問題ではない
+                  logger.warning(f"Warning: Could not get Node details for {node_name}: {e}")
 
-              # NodeClaim の現在の理由 (Reason) を取得
-              reason = None
+              # Event発生事由が「起動中」or「停止処理中」であるか
+              current_nodeclaim_reason = None
+              is_ready = False
               for condition in nodeclaim.get('status', {}).get('conditions', []):
+                if condition.get('type') == 'Ready' and condition.get('status') == 'True':
+                  is_ready = True
                 if condition.get('type') == 'Disrupting' and condition.get('status') == 'True':
-                  reason = "Disrupting"
-                  break
-              
-              # ログメッセージ
-              log_message = f"Event: {event_type} on NodeClaim: {nodeclaim_name}"
+                  current_nodeclaim_reason = "Disrupting"
 
+              # ログメッセージのベースを構築
+              base_log_message = f"NodeClaim: {nodeclaim_name}, EventType: {event_type}"
               if node_name:
-                log_message += f", Node: {node_name}"
+                base_log_message += f", NodeName: {node_name}"
               if instance_id:
-                log_message += f", Instance ID: {instance_id}"
+                base_log_message += f", InstanceID: {instance_id}"
               if node_ip_address:
-                log_message += f", IP: {node_ip_address}"
-              if reason:
-                log_message += f", Current Reason: {reason}"
-              
-              # Scale In イベントの検知ロジック
-              if event_type == 'DELETED':
-                print(f"--- DETECTED SCALE-IN (NodeClaim DELETED): {nodeclaim_name} ---")
-                # ここに通知ロジックなどを追加
-                # 削除されたノードの情報を含める
-                print(f"    Node Name: {node_name}, Instance ID: {instance_id}, IP: {node_ip_address}")
-              elif event_type == 'MODIFIED':
-                if reason == "Disrupting":
-                  print(f"--- DETECTED SCALE-IN (NodeClaim DISRUPTING): {nodeclaim_name} ---")
-                  # 終了プロセス中のノードの情報を含める
-                  print(f"    Node Name: {node_name}, Instance ID: {instance_id}, IP: {node_ip_address}")
-              
-              print(log_message)
+                base_log_message += f", IP: {node_ip_address}"
 
+              # --- スケールイベント(アウト・イン)の検知ロジック ---
+              if event_type == 'ADDED':
+                logger.info(f"+++ DETECTED SCALE-OUT (NodeClaim ADDED): {base_log_message} +++")
+                logger.debug(f"  Status: NodeClaim created. Waiting for node to be ready...")
+              elif event_type == 'MODIFIED':
+                if is_ready and not nodeclaim.get('metadata', {}).get('deletionTimestamp'):
+                  logger.debug(f"+++ DETECTED SCALE-OUT (Node READY): {base_log_message} +++")
+                  logger.debug(f"  Status: Node is fully ready and joined the cluster.")
+                elif current_nodeclaim_reason == "Disrupting":
+                  logger.debug(f"--- DETECTED SCALE-IN (NodeClaim DISRUPTING): {base_log_message} ---")
+                  logger.debug(f"  Status: Node is being disrupted/terminated.")
+              elif event_type == 'DELETED':
+                logger.info(f"--- DETECTED SCALE-IN (NodeClaim DELETED): {base_log_message} ---")
+                logger.debug(f"  Status: NodeClaim deleted. Node has been terminated.")
+              else:
+                logger.debug(f"--- Other NodeClaim Event: {base_log_message} ---")
+                logger.debug(f"  Status: Current reason - {current_nodeclaim_reason}, Ready: {is_ready}")
+                  
           if __name__ == "__main__":
             logging_karpenter_node_scale()
           EOF_PYTHON
