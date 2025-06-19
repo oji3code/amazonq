@@ -74,6 +74,7 @@ EOF
 # Create Deployment(Python App: Monitor for Kubernetes's Event of Node)
 #==========================================================
 
+kubectl delete deployment karpenter-node-logger -n karpenter-node-logger
 cat <<EOF | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
@@ -124,6 +125,7 @@ spec:
             }
           '''
           
+          # INFOレベル以上のログのみ出力
           log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
           logger = logging.getLogger('karpenter-node-logger')
           logger.setLevel(log_level)
@@ -142,10 +144,11 @@ spec:
                 "instance_id": kwargs.pop("instance_id", "N/A"),
                 "node_ip_address": kwargs.pop("node_ip_address", "N/A"),
                 "event_type": kwargs.pop("event_type", "N/A"),
-                "event_status": "%(event_status)s",
-                "scale_action": "%(scale_action)s"
               }
-              kwargs["extra"] = extra_fields
+              if 'extra' in kwargs:
+                  kwargs['extra'].update(extra_fields)
+              else:
+                  kwargs['extra'] = extra_fields
               return msg, kwargs
           
           karpenter_logger = CustomLogAdapter(logger, {})
@@ -153,8 +156,8 @@ spec:
           # 最後にログに記録されたNodeの状態を保持する辞書
           last_logged_node_states = {}
           
-          # ノード情報を取得する関数 (IPアドレスなど)
-          def get_node_info(core_api, node_name, nodeclaim_name, instance_id):
+          # Kubernetes NodeからInternal IPアドレスを取得する関数
+          def get_node_info(core_api, node_name):
             node_ip_address = "N/A"
             if node_name and node_name != "N/A":
               try:
@@ -164,11 +167,8 @@ spec:
                     node_ip_address = address.address
                     break
               except client.ApiException as e:
-                karpenter_logger.debug(f"Could not get Node details for {node_name}: {e}. Node might be deleted or not yet registered.",
-                                        nodeclaim_name=nodeclaim_name, node_name=node_name,
-                                        instance_id=instance_id, node_ip_address="N/A",
-                                        event_type="api_error", event_status="debug",
-                                        scale_action="N/A")
+                # Nodeがまだ登録されていない、またはAPIエラーの場合でも、ここではログを出さない
+                pass 
             return node_ip_address
           
           # Karpenterノードのスケーリングイベントを監視してログに記録するメイン関数
@@ -176,23 +176,14 @@ spec:
             try:
               config.load_kube_config()
             except config.ConfigException:
-              # インクラスタ設定にフォールバック (本番環境向け)
-              karpenter_logger.debug("Falling back to in-cluster config...",
-                                      nodeclaim_name="system", node_name="system",
-                                      instance_id="system", node_ip_address="system",
-                                      event_type="config_load", event_status="debug",
-                                      scale_action="N/A")
+              # 設定ファイルがない場合でも、ここではログを出さない
               config.load_incluster_config()
           
             core_api = client.CoreV1Api()
             custom_api = client.CustomObjectsApi()
             w = watch.Watch()
           
-            karpenter_logger.debug("Starting to watch NodeClaims for scale events...",
-                                    nodeclaim_name="system", node_name="system",
-                                    instance_id="system", node_ip_address="system",
-                                    event_type="watcher_startup", event_status="debug",
-                                    scale_action="N/A")
+            # 監視開始のログも出力しない
           
             # NodeClaimカスタムリソースの変更をストリームで監視
             for event in w.stream(custom_api.list_cluster_custom_object,
@@ -204,134 +195,83 @@ spec:
               original_event_type = event['type'] # イベントタイプ (ADDED, MODIFIED, DELETED)
               nodeclaim_name = nodeclaim['metadata']['name']
               
-              node_name = nodeclaim.get('status', {}).get('nodeName', 'N/A')
-              instance_id = "N/A"
+              # NodeClaimからnodeNameとproviderID（インスタンスID）を取得
+              node_name_from_nodeclaim = nodeclaim.get('status', {}).get('nodeName', 'N/A')
+              instance_id_from_nodeclaim = "N/A"
               provider_id = nodeclaim.get('status', {}).get('providerID')
               if provider_id:
-                instance_id = provider_id.split('/')[-1] # インスタンスIDの抽出
-          
-              current_node_ip_address = get_node_info(core_api, node_name, nodeclaim_name, instance_id)
+                instance_id_from_nodeclaim = provider_id.split('/')[-1]
           
               is_ready = False
-              is_disrupting = False
-              # NodeClaimのReadyとDisrupting状態を確認
+              # NodeClaimのReady状態を確認
               for condition in nodeclaim.get('status', {}).get('conditions', []):
                 if condition.get('type') == 'Ready' and condition.get('status') == 'True':
                   is_ready = True
-                if condition.get('type') == 'Disrupting' and condition.get('status') == 'True':
-                  is_disrupting = True
-          
-              # ログの共通パラメータを定義
-              base_log_params = {
-                "nodeclaim_name": nodeclaim_name,
-                "node_name": node_name,
-                "instance_id": instance_id,
-                "node_ip_address": current_node_ip_address,
-                "event_type": original_event_type,
-              }
           
               # 前回のログ記録時のNodeの状態を取得または初期化
               current_node_state = last_logged_node_states.get(nodeclaim_name, {
                   "is_ready": False,
-                  "is_disrupting": False,
                   "deleted_logged": False,
-                  "provider_id_set": False,
+                  "cached_nodeclaim_name": nodeclaim_name,
+                  "cached_node_name": "N/A",
                   "cached_instance_id": "N/A",
-                  "cached_node_ip_address": "N/A",
-                  "cached_node_name": "N/A"
+                  "cached_node_ip_address": "N/A"
               })
           
               # イベントタイプに応じたログ処理
-              if original_event_type == 'ADDED':
-                # NodeClaim追加イベント (スケールアウト開始)
-                karpenter_logger.debug(f"NodeClaim ADDED. Node provisioning initiated.",
-                                       event_status="scale_out_initiated",
-                                       scale_action="N/A",
-                                       **base_log_params)
-                # 状態を更新してキャッシュ
-                last_logged_node_states[nodeclaim_name] = {
-                    "is_ready": is_ready,
-                    "is_disrupting": is_disrupting,
-                    "deleted_logged": False,
-                    "provider_id_set": bool(provider_id),
-                    "cached_instance_id": instance_id,
-                    "cached_node_ip_address": current_node_ip_address,
-                    "cached_node_name": node_name
-                }
-          
-              elif original_event_type == 'MODIFIED':
+              if original_event_type == 'MODIFIED':
                 # NodeClaim変更イベント
                 if is_ready and not current_node_state["is_ready"]:
-                  # NodeがREADYになった (スケールアウト完了)
-                  karpenter_logger.info(f"Node is READY and joined the cluster. Scale Out completed.",
-                                         event_status="node_ready",
-                                         scale_action="ScaleOut",
-                                         **base_log_params)
-                  current_node_state["is_ready"] = True
-                  current_node_state["cached_instance_id"] = instance_id
-                  current_node_state["cached_node_ip_address"] = current_node_ip_address
-                  current_node_state["cached_node_name"] = node_name
-                  last_logged_node_states[nodeclaim_name] = current_node_state
-                
-                elif is_disrupting and not current_node_state["is_disrupting"]:
-                  # NodeがDisrupting状態になった (スケールイン開始)
-                  karpenter_logger.info(f"Node is being disrupted/terminated. Scale In initiated.",
-                                         event_status="scale_in_disrupting",
-                                         scale_action="ScaleIn",
-                                         **base_log_params)
-                  current_node_state["is_disrupting"] = True
-                  last_logged_node_states[nodeclaim_name] = current_node_state
+                  # 初めてReadyになった時にNode情報を取得
+                  actual_node_ip_address = get_node_info(core_api, node_name_from_nodeclaim)
+                  
+                  # Node名、インスタンスID、IPアドレスがすべて"N/A"ではない場合にのみキャッシュし、INFOログを出力
+                  if node_name_from_nodeclaim != "N/A" and \
+                     instance_id_from_nodeclaim != "N/A" and \
+                     actual_node_ip_address != "N/A":
+                    
+                    # キャッシュを更新
+                    current_node_state["is_ready"] = True
+                    current_node_state["cached_node_name"] = node_name_from_nodeclaim
+                    current_node_state["cached_instance_id"] = instance_id_from_nodeclaim
+                    current_node_state["cached_node_ip_address"] = actual_node_ip_address
+                    last_logged_node_states[nodeclaim_name] = current_node_state
           
-                elif provider_id and not current_node_state["provider_id_set"]:
-                  # providerIDが設定された (ノードプロビジョニングの進捗)
-                  karpenter_logger.debug(f"NodeClaim providerID set: {instance_id}",
-                                         event_status="provider_id_set",
-                                         scale_action="N/A",
-                                         **base_log_params)
-                  current_node_state["provider_id_set"] = True
-                  last_logged_node_states[nodeclaim_name] = current_node_state
-          
-                else:
-                  karpenter_logger.debug(f"NodeClaim MODIFIED: No significant state change detected or already logged.",
-                                          event_status="modified_noop",
-                                          scale_action="N/A",
-                                          **base_log_params)
+                    # ReadyになったNode情報をInfoレベルでログに出力 (スケールアウト完了)
+                    karpenter_logger.info(f"Node is READY and joined the cluster. Scale Out completed.",
+                                           nodeclaim_name=current_node_state["cached_nodeclaim_name"],
+                                           node_name=current_node_state["cached_node_name"],
+                                           instance_id=current_node_state["cached_instance_id"],
+                                           node_ip_address=current_node_state["cached_node_ip_address"],
+                                           event_type=original_event_type,
+                                           extra={"event_status": "node_ready", "scale_action": "ScaleOut"})
+                  else:
+                    # 情報がまだ揃っていない場合は、Ready状態を更新して、次回以降のMODIFIEDイベントで再評価
+                    # ただし、ログは出力しない
+                    current_node_state["is_ready"] = True # 一度Readyになったら再トリガーしない
+                    last_logged_node_states[nodeclaim_name] = current_node_state
           
               elif original_event_type == 'DELETED':
                 # NodeClaim削除イベント (スケールイン完了)
-                if not current_node_state["deleted_logged"]:
-                  # 削除ログが未記録の場合のみ記録
-                  log_params_for_delete = {
-                      "nodeclaim_name": nodeclaim_name,
-                      "node_name": current_node_state["cached_node_name"],
-                      "instance_id": current_node_state["cached_instance_id"],
-                      "node_ip_address": current_node_state["cached_node_ip_address"],
-                      "event_type": original_event_type,
-                      "event_status": "scale_in_terminated",
-                      "scale_action": "ScaleIn"
-                  }
+                # キャッシュされた情報がある場合にのみログを出力
+                if nodeclaim_name in last_logged_node_states and not current_node_state["deleted_logged"]:
+                  # DELETEDイベントでは常にキャッシュされた情報を使用
                   karpenter_logger.info(f"NodeClaim DELETED. Node has been terminated. Scale In completed.",
-                                         **log_params_for_delete)
+                                         nodeclaim_name=current_node_state["cached_nodeclaim_name"],
+                                         node_name=current_node_state["cached_node_name"],
+                                         instance_id=current_node_state["cached_instance_id"],
+                                         node_ip_address=current_node_state["cached_node_ip_address"],
+                                         event_type=original_event_type,
+                                         extra={"event_status": "scale_in_terminated", "scale_action": "ScaleIn"})
                   current_node_state["deleted_logged"] = True
                   # ログ記録後、キャッシュから削除
-                  if nodeclaim_name in last_logged_node_states:
-                      del last_logged_node_states[nodeclaim_name]
-                else:
-                  karpenter_logger.debug(f"NodeClaim DELETED event received, but already logged or processed for {nodeclaim_name}.",
-                                          event_status="deleted_noop",
-                                          scale_action="N/A",
-                                          **base_log_params)
-              else:
-                karpenter_logger.debug(f"Other NodeClaim Event: Unhandled event type.",
-                                        event_status="unhandled_event",
-                                        scale_action="N/A",
-                                        **base_log_params)
+                  del last_logged_node_states[nodeclaim_name]
+                # キャッシュがない、または既にログ済みの場合、何も出力しない
                             
-          # スクリプトが直接実行された場合にメイン関数を呼び出す
           if __name__ == "__main__":
             logging_karpenter_node_scale()
-            EOF_PYTHON
-            python /app/karpenter-node-logger.py
+          EOF_PYTHON
+          python /app/karpenter-node-logger.py
         env:
         - name: LOG_LEVEL
           value: INFO
