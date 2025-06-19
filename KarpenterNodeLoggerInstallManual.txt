@@ -107,154 +107,195 @@ spec:
           pip install kubernetes requests python-json-logger > /dev/null 2>&1
           mkdir /app
           cat > /app/karpenter-node-logger.py << 'EOF_PYTHON'
-          import logging
-          from pythonjsonlogger import jsonlogger
-          from kubernetes import client, config, watch
-          import os # 環境変数利用のためインポート
-          
-          # カスタムフィールドをログに追加するためのフォーマット
-          # %(asctime)s を含めることでDatadogが正確なタイムスタンプを認識します
-          LOG_FORMAT = '''
-            {
-              "timestamp": "%(asctime)s",
-              "level": "%(levelname)s",
-              "message": "%(message)s",
-              "nodeclaim_name": "%(nodeclaim_name)s",
-              "node_name": "%(node_name)s",
-              "instance_id": "%(instance_id)s",
-              "node_ip_address": "%(node_ip_address)s",
-              "karpenter_event_type": "%(karpenter_event_type)s",
-              "karpenter_event_status": "%(karpenter_event_status)s"
-            }
-          '''
-          
-          # ロガーの設定
-          # LOG_LEVEL 環境変数でログレベルを制御可能 (デフォルト: INFO)
-          log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
-          logger = logging.getLogger('karpenter-node-logger')
-          logger.setLevel(log_level)
-          
-          logHandler = logging.StreamHandler()
-          formatter = jsonlogger.JsonFormatter(LOG_FORMAT)
-          logHandler.setFormatter(formatter)
-          logger.addHandler(logHandler)
-          
-          # ログメッセージにカスタムフィールドを渡すためのヘルパークラス
-          class CustomLogAdapter(logging.LoggerAdapter):
-            def process(self, msg, kwargs):
-              # kwargsからカスタムフィールドを抽出し、msgのextraにマージ
-              extra_fields = {
-                "nodeclaim_name": kwargs.pop("nodeclaim_name", "N/A"),
-                "node_name": kwargs.pop("node_name", "N/A"),
-                "instance_id": kwargs.pop("instance_id", "N/A"),
-                "node_ip_address": kwargs.pop("node_ip_address", "N/A"),
-                "karpenter_event_type": kwargs.pop("karpenter_event_type", "N/A"),
-                "karpenter_event_status": kwargs.pop("karpenter_event_status", "N/A")
-              }
-              kwargs["extra"] = extra_fields
-              return msg, kwargs
-          
-          # ロガーアダプタのインスタンス化
-          karpenter_logger = CustomLogAdapter(logger, {})
-          
-          def logging_karpenter_node_scale():
-            try:
-              # kubeconfig を読み込む (開発環境/ローカル実行用)
-              config.load_kube_config()
-            except config.ConfigException:
-              # Pod内で実行する場合は in-cluster config にフォールバック
-              karpenter_logger.debug("Falling back to in-cluster config...",
-                                    nodeclaim_name="system", node_name="system",
-                                    instance_id="system", node_ip_address="system",
-                                    karpenter_event_type="config_load", karpenter_event_status="info")
-              config.load_incluster_config()
-          
-            core_api = client.CoreV1Api()
-            custom_api = client.CustomObjectsApi()
-            w = watch.Watch()
-          
-            karpenter_logger.debug("Starting to watch NodeClaims for scale events...",
-                                  nodeclaim_name="system", node_name="system",
-                                  instance_id="system", node_ip_address="system",
-                                  karpenter_event_type="watcher_startup", karpenter_event_status="info")
-          
-            for event in w.stream(custom_api.list_cluster_custom_object,
-                                    group="karpenter.sh",
-                                    version="v1",
-                                    plural="nodeclaims"):
-              
-              nodeclaim = event['object']
-              original_event_type = event['type'] # Kubernetesからの元のイベントタイプ (ADDED, MODIFIED, DELETED)
-              nodeclaim_name = nodeclaim['metadata']['name']
-              node_name = nodeclaim.get('status', {}).get('nodeName', 'N/A')
-              
-              instance_id = "N/A"
-              provider_id = nodeclaim.get('status', {}).get('providerID')
-              if provider_id:
-                instance_id = provider_id.split('/')[-1]
-          
-              node_ip_address = "N/A"
-              if node_name and node_name != "N/A":
-                try:
-                  node_obj = core_api.read_node(name=node_name)
-                  for address in node_obj.status.addresses:
-                    if address.type == 'InternalIP':
-                      node_ip_address = address.address
-                      break
-                except client.ApiException as e:
-                  # ノード詳細取得エラーはDEBUGとしてログ
-                  karpenter_logger.debug(f"Could not get Node details for {node_name}: {e}",
-                                            nodeclaim_name=nodeclaim_name, node_name=node_name,
-                                            instance_id=instance_id, node_ip_address="N/A",
-                                            karpenter_event_type="api_error", karpenter_event_status="debug")
-          
-              current_nodeclaim_reason = "N/A"
-              is_ready = False
-              for condition in nodeclaim.get('status', {}).get('conditions', []):
-                if condition.get('type') == 'Ready' and condition.get('status') == 'True':
-                  is_ready = True
-                if condition.get('type') == 'Disrupting' and condition.get('status') == 'True':
-                  current_nodeclaim_reason = "Disrupting"
-          
-              # ログメッセージに共通で含めるパラメータ
-              # karpenter_event_status は各ログ呼び出しで上書きされることを想定
-              base_log_params = {
-                "nodeclaim_name": nodeclaim_name,
-                "node_name": node_name,
-                "instance_id": instance_id,
-                "node_ip_address": node_ip_address,
-                "karpenter_event_type": original_event_type, # 元のK8sイベントタイプ
-              }
-          
-              # スケールイベント(アウト・イン)の検知ロジック
-              if original_event_type == 'ADDED':
-                karpenter_logger.info(f"NodeClaim ADDED. Node provisioning initiated.",
-                                       karpenter_event_status="scale_out_initiated", # ここでstatusを指定
-                                       **base_log_params)
-              elif original_event_type == 'MODIFIED':
-                if is_ready and not nodeclaim.get('metadata', {}).get('deletionTimestamp'):
-                  karpenter_logger.debug(f"Node is READY and joined the cluster.",
-                                         karpenter_event_status="node_ready",
-                                         **base_log_params)
-                elif current_nodeclaim_reason == "Disrupting":
-                  karpenter_logger.debug(f"Node is being disrupted/terminated.",
-                                         karpenter_event_status="scale_in_disrupting",
-                                         **base_log_params)
-                else:
-                  # MODIFIEDだが、上記の重要な状態変化ではない場合 (例: NOOP)
-                  karpenter_logger.debug(f"NodeClaim MODIFIED: No significant state change detected.",
-                                          karpenter_event_status="modified_noop",
-                                          **base_log_params)
-              elif original_event_type == 'DELETED':
-                karpenter_logger.info(f"NodeClaim DELETED. Node has been terminated.",
-                                       karpenter_event_status="scale_in_terminated",
-                                       **base_log_params)
-              else:
-                # その他の未知のイベントタイプ
-                karpenter_logger.debug(f"Other NodeClaim Event: Unhandled event type.",
-                                        karpenter_event_status="unhandled_event",
-                                        **base_log_params)
-                            
+import logging
+from pythonjsonlogger import jsonlogger
+from kubernetes import client, config, watch
+import os
+
+LOG_FORMAT = '''
+  {
+    "timestamp": "%(asctime)s",
+    "level": "%(levelname)s",
+    "message": "%(message)s",
+    "nodeclaim_name": "%(nodeclaim_name)s",
+    "node_name": "%(node_name)s",
+    "instance_id": "%(instance_id)s",
+    "node_ip_address": "%(node_ip_address)s",
+    "karpenter_event_type": "%(karpenter_event_type)s",
+    "karpenter_event_status": "%(karpenter_event_status)s"
+  }
+'''
+
+log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
+logger = logging.getLogger('karpenter-node-logger')
+logger.setLevel(log_level)
+
+logHandler = logging.StreamHandler()
+formatter = jsonlogger.JsonFormatter(LOG_FORMAT)
+logHandler.setFormatter(formatter)
+logger.addHandler(logHandler)
+
+class CustomLogAdapter(logging.LoggerAdapter):
+  def process(self, msg, kwargs):
+    extra_fields = {
+      "nodeclaim_name": kwargs.pop("nodeclaim_name", "N/A"),
+      "node_name": kwargs.pop("node_name", "N/A"),
+      "instance_id": kwargs.pop("instance_id", "N/A"),
+      "node_ip_address": kwargs.pop("node_ip_address", "N/A"),
+      "karpenter_event_type": kwargs.pop("karpenter_event_type", "N/A"),
+      "karpenter_event_status": kwargs.pop("karpenter_event_status", "N/A")
+    }
+    kwargs["extra"] = extra_fields
+    return msg, kwargs
+
+karpenter_logger = CustomLogAdapter(logger, {})
+
+# 各NodeClaimの最終ログ状態を保持する辞書
+# { "nodeclaim-name": {"is_ready": bool, "is_disrupting": bool, "deleted_logged": bool, "provider_id_set": bool} }
+last_logged_node_states = {}
+
+def get_node_info(core_api, node_name, nodeclaim_name, instance_id):
+  """ノードのIPアドレスを取得するヘルパー関数"""
+  node_ip_address = "N/A"
+  if node_name and node_name != "N/A":
+    try:
+      node_obj = core_api.read_node(name=node_name)
+      for address in node_obj.status.addresses:
+        if address.type == 'InternalIP':
+          node_ip_address = address.address
+          break
+    except client.ApiException as e:
+      karpenter_logger.debug(f"Could not get Node details for {node_name}: {e}",
+                              nodeclaim_name=nodeclaim_name, node_name=node_name,
+                              instance_id=instance_id, node_ip_address="N/A",
+                              karpenter_event_type="api_error", karpenter_event_status="debug")
+  return node_ip_address
+
+def logging_karpenter_node_scale():
+  try:
+    config.load_kube_config()
+  except config.ConfigException:
+    karpenter_logger.debug("Falling back to in-cluster config...",
+                            nodeclaim_name="system", node_name="system",
+                            instance_id="system", node_ip_address="system",
+                            karpenter_event_type="config_load", karpenter_event_status="info")
+    config.load_incluster_config()
+
+  core_api = client.CoreV1Api()
+  custom_api = client.CustomObjectsApi()
+  w = watch.Watch()
+
+  karpenter_logger.debug("Starting to watch NodeClaims for scale events...",
+                          nodeclaim_name="system", node_name="system",
+                          instance_id="system", node_ip_address="system",
+                          karpenter_event_type="watcher_startup", karpenter_event_status="info")
+
+  for event in w.stream(custom_api.list_cluster_custom_object,
+                          group="karpenter.sh",
+                          version="v1",
+                          plural="nodeclaims"):
+    
+    nodeclaim = event['object']
+    original_event_type = event['type']
+    nodeclaim_name = nodeclaim['metadata']['name']
+    node_name = nodeclaim.get('status', {}).get('nodeName', 'N/A')
+    
+    instance_id = "N/A"
+    provider_id = nodeclaim.get('status', {}).get('providerID')
+    if provider_id:
+      instance_id = provider_id.split('/')[-1]
+
+    node_ip_address = get_node_info(core_api, node_name, nodeclaim_name, instance_id)
+
+    is_ready = False
+    is_disrupting = False # 新しいフラグ
+    for condition in nodeclaim.get('status', {}).get('conditions', []):
+      if condition.get('type') == 'Ready' and condition.get('status') == 'True':
+        is_ready = True
+      if condition.get('type') == 'Disrupting' and condition.get('status') == 'True':
+        is_disrupting = True # Disrupting状態を検出
+
+    # ログメッセージに共通で含めるパラメータ
+    base_log_params = {
+      "nodeclaim_name": nodeclaim_name,
+      "node_name": node_name,
+      "instance_id": instance_id,
+      "node_ip_address": node_ip_address,
+      "karpenter_event_type": original_event_type,
+    }
+
+    # 各NodeClaimの現在の状態を取得、なければ初期化
+    current_node_state = last_logged_node_states.get(nodeclaim_name, {
+        "is_ready": False,
+        "is_disrupting": False,
+        "deleted_logged": False,
+        "provider_id_set": False # providerIDがセットされたことを追跡
+    })
+
+    if original_event_type == 'ADDED':
+      # ADDEDイベントは常にINFOログを出力
+      karpenter_logger.info(f"NodeClaim ADDED. Node provisioning initiated.",
+                             karpenter_event_status="scale_out_initiated",
+                             **base_log_params)
+      # 状態を初期化/更新
+      last_logged_node_states[nodeclaim_name] = {
+          "is_ready": is_ready,
+          "is_disrupting": is_disrupting,
+          "deleted_logged": False,
+          "provider_id_set": bool(provider_id)
+      }
+
+    elif original_event_type == 'MODIFIED':
+      # NodeClaimがReadyになったことを検出 (かつ一度しかログしない)
+      if is_ready and not current_node_state["is_ready"]:
+        karpenter_logger.info(f"Node is READY and joined the cluster.",
+                               karpenter_event_status="node_ready",
+                               **base_log_params)
+        current_node_state["is_ready"] = True
+        last_logged_node_states[nodeclaim_name] = current_node_state # 状態を更新
+      
+      # NodeClaimがDisruptingになったことを検出 (かつ一度しかログしない)
+      elif is_disrupting and not current_node_state["is_disrupting"]:
+        karpenter_logger.info(f"Node is being disrupted/terminated.",
+                               karpenter_event_status="scale_in_disrupting",
+                               **base_log_params)
+        current_node_state["is_disrupting"] = True
+        last_logged_node_states[nodeclaim_name] = current_node_state # 状態を更新
+
+      # providerIDがセットされたことを検出 (まだログしていない場合のみ)
+      elif provider_id and not current_node_state["provider_id_set"]:
+        karpenter_logger.info(f"NodeClaim providerID set: {instance_id}",
+                               karpenter_event_status="provider_id_set",
+                               **base_log_params)
+        current_node_state["provider_id_set"] = True
+        last_logged_node_states[nodeclaim_name] = current_node_state
+
+      # それ以外のMODIFIEDイベントはDEBUGレベルでログ（ノイズ削減）
+      else:
+        karpenter_logger.debug(f"NodeClaim MODIFIED: No significant state change detected or already logged.",
+                                karpenter_event_status="modified_noop",
+                                **base_log_params)
+
+    elif original_event_type == 'DELETED':
+      # DELETEDイベントは一度しかログしない
+      if not current_node_state["deleted_logged"]:
+        karpenter_logger.info(f"NodeClaim DELETED. Node has been terminated.",
+                               karpenter_event_status="scale_in_terminated",
+                               **base_log_params)
+        current_node_state["deleted_logged"] = True
+        # DELETEDイベントの場合は、ディクショナリから完全に削除
+        if nodeclaim_name in last_logged_node_states:
+            del last_logged_node_states[nodeclaim_name]
+      else:
+        # 既にDELETEDログ済みなら、このイベントはスキップ (重複防止)
+        karpenter_logger.debug(f"NodeClaim DELETED event received, but already logged or processed for {nodeclaim_name}.",
+                                karpenter_event_status="deleted_noop",
+                                **base_log_params)
+    else:
+      # その他の未知のイベントタイプ
+      karpenter_logger.debug(f"Other NodeClaim Event: Unhandled event type.",
+                              karpenter_event_status="unhandled_event",
+                              **base_log_params)
           if __name__ == "__main__":
             logging_karpenter_node_scale()
           EOF_PYTHON
