@@ -71,11 +71,25 @@ roleRef:
 EOF
 
 #==========================================================
+# Create ConfigMap
+#==========================================================
+export ENV="inf"
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: karpenter-scale-logger-config
+  namespace: karpenter-scale-logger
+data:
+  ENV: "${ENV}"
+  LOG_LEVEL: "INFO"
+EOF
+
+#==========================================================
 # Create Deployment(Python App: Monitor for Kubernetes's Event of Node)
 #==========================================================
 
 kubectl delete deployment karpenter-scale-logger -n karpenter-scale-logger
-export ENV="inf"
 cat <<EOF | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
@@ -92,7 +106,7 @@ spec:
       labels:
         app: karpenter-scale-logger
       annotations:
-        ad.datadoghq.com/karpenter-scale-logger.logs: '[{"source": "python", "service": "karpenter", "env": "$(ENV)"}]'
+        ad.datadoghq.com/karpenter-scale-logger.logs: '[{"source": "python", "service": "karpenter"]'
     spec:
       serviceAccountName: karpenter-scale-logger
       containers:
@@ -110,12 +124,13 @@ spec:
           from kubernetes import client, config, watch
           import os
           
-          # JSONログ出力フォーマット
+          # JSONログ出力フォーマットを定義
           LOG_FORMAT = '''
             {
               "timestamp": "%(asctime)s",
               "level": "%(levelname)s",
               "message": "%(message)s",
+              "env": "%(env)s",
               "nodeclaim_name": "%(nodeclaim_name)s",
               "node_name": "%(node_name)s",
               "instance_id": "%(instance_id)s",
@@ -126,6 +141,7 @@ spec:
             }
           '''
           
+          # ログレベルを設定
           log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
           logger = logging.getLogger('karpenter-scale-logger')
           logger.setLevel(log_level)
@@ -139,11 +155,12 @@ spec:
           class CustomLogAdapter(logging.LoggerAdapter):
             def process(self, msg, kwargs):
               extra_fields = {
+                "env": os.getenv('ENV', 'N/A'),
                 "nodeclaim_name": kwargs.pop("nodeclaim_name", "N/A"),
                 "node_name": kwargs.pop("node_name", "N/A"),
                 "instance_id": kwargs.pop("instance_id", "N/A"),
                 "node_ip_address": kwargs.pop("node_ip_address", "N/A"),
-                "event_type": kwargs.pop("event_type", "N/A"),
+                "event_type": kwargs.pop("event_type", "N/A")
               }
               if 'extra' in kwargs:
                 kwargs['extra'].update(extra_fields)
@@ -317,9 +334,15 @@ spec:
           python /app/karpenter-scale-logger.py
         env:
         - name: LOG_LEVEL
-          value: INFO
+          valueFrom:
+            configMapKeyRef:
+              name: karpenter-scale-logger-config
+              key: LOG_LEVEL
         - name: ENV
-          value: "$(ENV)" 
+          valueFrom:
+            configMapKeyRef:
+              name: karpenter-scale-logger-config
+              key: ENV
         resources:
           requests:
             memory: "128Mi"
