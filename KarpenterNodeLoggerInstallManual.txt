@@ -245,11 +245,6 @@ spec:
                                            node_ip_address=current_node_state["cached_node_ip_address"],
                                            event_type=original_event_type,
                                            extra={"event_status": "node_ready", "scale_action": "ScaleOut"})
-                  else:
-                    # 情報がまだ揃っていない場合は、Ready状態を更新して、次回以降のMODIFIEDイベントで再評価
-                    # ただし、ログは出力しない
-                    current_node_state["is_ready"] = True # 一度Readyになったら再トリガーしない
-                    last_logged_node_states[nodeclaim_name] = current_node_state
           
               elif original_event_type == 'DELETED':
                 # NodeClaim削除イベント (スケールイン完了)
