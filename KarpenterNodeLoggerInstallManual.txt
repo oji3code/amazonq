@@ -45,28 +45,28 @@ cat <<EOF | kubectl apply -f -
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: karpenter-node-logger # 任意でわかりやすい名前に変更可能
+  name: karpenter-node-logger
 rules:
-- apiGroups: [""] # "" はコアAPIグループ（ノードなど）を示す
+- apiGroups: [""]
   resources: ["nodes"]
-  verbs: ["get", "list", "watch"] # get だけでなく、list と watch もあると良い
-- apiGroups: ["karpenter.sh"] # NodeClaimリソースのAPIグループ
-  resources: ["nodeclaims"] # 監視したいリソース
-  verbs: ["get", "list", "watch"] # 取得、一覧表示、監視の権限を付与
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["karpenter.sh"]
+  resources: ["nodeclaims"]
+  verbs: ["get", "list", "watch"]
 EOF
 
 cat <<EOF | kubectl apply -f -
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: karpenter-node-logger-binding # 任意でわかりやすい名前に変更可能
+  name: karpenter-node-logger-binding
 subjects:
 - kind: ServiceAccount
-  name: karpenter-node-logger # エラーメッセージに表示されたサービスアカウント名
-  namespace: karpenter-node-logger # エラーメッセージに表示されたサービスアカウントの名前空間
+  name: karpenter-node-logger
+  namespace: karpenter-node-logger
 roleRef:
   kind: ClusterRole
-  name: karpenter-node-logger # 上記で作成したClusterRoleの名前
+  name: karpenter-node-logger
   apiGroup: rbac.authorization.k8s.io
 EOF
 
@@ -342,7 +342,7 @@ spec:
           python /app/karpenter-node-logger.py
         env:
         - name: LOG_LEVEL
-          value: DEBUG
+          value: INFO
         resources:
           requests:
             memory: "128Mi"
