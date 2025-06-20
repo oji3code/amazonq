@@ -106,7 +106,7 @@ spec:
       labels:
         app: karpenter-scale-logger
       annotations:
-        ad.datadoghq.com/karpenter-scale-logger.logs: '[{"source": "python", "service": "karpenter"]'
+        ad.datadoghq.com/karpenter-scale-logger.logs: '[{"source": "python", "service": "karpenter"}]'
     spec:
       serviceAccountName: karpenter-scale-logger
       containers:
