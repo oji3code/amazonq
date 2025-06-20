@@ -125,8 +125,8 @@ spec:
             }
           '''
           
-          # INFOレベル以上のログのみ出力
-          log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
+          # デフォルトのログレベルをDEBUGに設定し、環境変数でオーバーライド可能にする
+          log_level = os.getenv('LOG_LEVEL', 'DEBUG').upper()
           logger = logging.getLogger('karpenter-node-logger')
           logger.setLevel(log_level)
           
@@ -167,8 +167,11 @@ spec:
                     node_ip_address = address.address
                     break
               except client.ApiException as e:
-                # Nodeがまだ登録されていない、またはAPIエラーの場合でも、ここではログを出さない
-                pass 
+                # Node情報取得失敗時のデバッグログを追加
+                karpenter_logger.debug(f"Failed to get Node details for {node_name}: {e}. Node might be deleted or not yet registered.",
+                                        node_name=node_name,
+                                        extra={"event_type": "api_error", "event_status": "debug_node_lookup_failed", "scale_action": "N/A",
+                                               "nodeclaim_name": "N/A", "instance_id": "N/A", "node_ip_address": "N/A"})
             return node_ip_address
           
           # Karpenterノードのスケーリングイベントを監視してログに記録するメイン関数
@@ -176,14 +179,22 @@ spec:
             try:
               config.load_kube_config()
             except config.ConfigException:
-              # 設定ファイルがない場合でも、ここではログを出さない
+              # インクラスタ設定にフォールバック時のデバッグログを追加
+              karpenter_logger.debug("Falling back to in-cluster config for Kubernetes API access.",
+                                      nodeclaim_name="system", node_name="system",
+                                      instance_id="system", node_ip_address="system",
+                                      extra={"event_type": "config_load", "event_status": "debug_in_cluster_config", "scale_action": "N/A"})
               config.load_incluster_config()
           
             core_api = client.CoreV1Api()
             custom_api = client.CustomObjectsApi()
             w = watch.Watch()
           
-            # 監視開始のログも出力しない
+            # ウォッチャー開始時のデバッグログを追加
+            karpenter_logger.debug("Starting to watch NodeClaims for events...",
+                                    nodeclaim_name="system", node_name="system",
+                                    instance_id="system", node_ip_address="system",
+                                    extra={"event_type": "watcher_startup", "event_status": "debug_watcher_started", "scale_action": "N/A"})
           
             # NodeClaimカスタムリソースの変更をストリームで監視
             for event in w.stream(custom_api.list_cluster_custom_object,
@@ -218,7 +229,16 @@ spec:
                   "cached_node_ip_address": "N/A"
               })
           
-              # イベントタイプに応じたログ処理
+              # 各イベントタイプに対するデバッグログを追加
+              karpenter_logger.debug(f"Processing NodeClaim event. Type: {original_event_type}, NodeClaim: {nodeclaim_name}, Ready: {is_ready}",
+                                      nodeclaim_name=nodeclaim_name,
+                                      node_name=node_name_from_nodeclaim,
+                                      instance_id=instance_id_from_nodeclaim,
+                                      node_ip_address="N/A", # 一般的なイベントではIPはまだ不明な場合が多い
+                                      event_type=original_event_type,
+                                      extra={"event_status": "debug_event_received", "scale_action": "N/A"})
+          
+          
               if original_event_type == 'MODIFIED':
                 # NodeClaim変更イベント
                 if is_ready and not current_node_state["is_ready"]:
@@ -245,10 +265,44 @@ spec:
                                            node_ip_address=current_node_state["cached_node_ip_address"],
                                            event_type=original_event_type,
                                            extra={"event_status": "node_ready", "scale_action": "ScaleOut"})
+                  else:
+                    # 情報がまだ揃っていない場合のデバッグログ
+                    karpenter_logger.debug(f"NodeClaim is READY, but full Node info (IP/Instance ID) not yet available. Waiting for next update.",
+                                           nodeclaim_name=nodeclaim_name,
+                                           node_name=node_name_from_nodeclaim,
+                                           instance_id=instance_id_from_nodeclaim,
+                                           node_ip_address=actual_node_ip_address,
+                                           event_type=original_event_type,
+                                           extra={"event_status": "debug_ready_partial_info", "scale_action": "N/A"})
+                    # is_ready状態のみ更新し、次回以降の「初めてReadyになった」ログが再トリガーされないようにする
+                    current_node_state["is_ready"] = True 
+                    last_logged_node_states[nodeclaim_name] = current_node_state
+          
+                elif provider_id and not current_node_state["cached_instance_id"] == instance_id_from_nodeclaim: # providerIDが更新された場合
+                  # providerIDが設定されたタイミングでキャッシュを更新（IPはまだ不明でも）
+                  current_node_state["cached_instance_id"] = instance_id_from_nodeclaim
+                  current_node_state["cached_node_name"] = node_name_from_nodeclaim
+                  last_logged_node_states[nodeclaim_name] = current_node_state
+          
+                  karpenter_logger.debug(f"NodeClaim providerID updated to: {instance_id_from_nodeclaim}.",
+                                         nodeclaim_name=current_node_state["cached_nodeclaim_name"],
+                                         node_name=current_node_state["cached_node_name"],
+                                         instance_id=current_node_state["cached_instance_id"],
+                                         node_ip_address=current_node_state["cached_node_ip_address"],
+                                         event_type=original_event_type,
+                                         extra={"event_status": "debug_provider_id_set", "scale_action": "N/A"})
+                else:
+                  # その他のMODIFIEDイベントのデバッグログを追加
+                  karpenter_logger.debug(f"NodeClaim MODIFIED event with no significant state change. NodeClaim: {nodeclaim_name}",
+                                          nodeclaim_name=nodeclaim_name,
+                                          node_name=node_name_from_nodeclaim,
+                                          instance_id=instance_id_from_nodeclaim,
+                                          node_ip_address="N/A", # この時点では通常IPを再取得しない
+                                          event_type=original_event_type,
+                                          extra={"event_status": "debug_modified_noop", "scale_action": "N/A"})
           
               elif original_event_type == 'DELETED':
                 # NodeClaim削除イベント (スケールイン完了)
-                # キャッシュされた情報がある場合にのみログを出力
                 if nodeclaim_name in last_logged_node_states and not current_node_state["deleted_logged"]:
                   # DELETEDイベントでは常にキャッシュされた情報を使用
                   karpenter_logger.info(f"NodeClaim DELETED. Node has been terminated. Scale In completed.",
@@ -261,7 +315,26 @@ spec:
                   current_node_state["deleted_logged"] = True
                   # ログ記録後、キャッシュから削除
                   del last_logged_node_states[nodeclaim_name]
-                # キャッシュがない、または既にログ済みの場合、何も出力しない
+                else:
+                  # キャッシュがない、または既にログ済みの場合のデバッグログを追加
+                  # このパスではcurrent_node_stateが信頼できない場合があるので、nodeclaim_nameのみをキーに使う
+                  logged_name = last_logged_node_states.get(nodeclaim_name, {}).get("cached_nodeclaim_name", nodeclaim_name)
+                  karpenter_logger.debug(f"NodeClaim DELETED event received, but already logged or no cache for {logged_name}.",
+                                          nodeclaim_name=logged_name,
+                                          node_name="N/A", # キャッシュがない場合はN/A
+                                          instance_id="N/A", # キャッシュがない場合はN/A
+                                          node_ip_address="N/A", # キャッシュがない場合はN/A
+                                          event_type=original_event_type,
+                                          extra={"event_status": "debug_deleted_noop", "scale_action": "N/A"})
+              else:
+                # その他の未知のイベントタイプのデバッグログを追加
+                karpenter_logger.debug(f"Unhandled NodeClaim Event type: {original_event_type}. NodeClaim: {nodeclaim_name}",
+                                        nodeclaim_name=nodeclaim_name,
+                                        node_name=node_name_from_nodeclaim,
+                                        instance_id=instance_id_from_nodeclaim,
+                                        node_ip_address="N/A",
+                                        event_type=original_event_type,
+                                        extra={"event_status": "debug_unhandled_event", "scale_action": "N/A"})
                             
           if __name__ == "__main__":
             logging_karpenter_node_scale()
@@ -269,7 +342,7 @@ spec:
           python /app/karpenter-node-logger.py
         env:
         - name: LOG_LEVEL
-          value: INFO
+          value: DEBUG
         resources:
           requests:
             memory: "128Mi"
