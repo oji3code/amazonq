@@ -364,9 +364,9 @@ kubectl logs -n karpenter-scale-logger $(kubectl get po -n karpenter-scale-logge
 # CleanUP
 #==========================================================
 
-kubectl delete deployment karpenter-node-logger -n karpenter-node-logger
-kubectl delete ClusterRoleBinding karpenter-node-logger-binding
-kubectl delete ClusterRole karpenter-node-logger -n karpenter-node-logger
-kubectl delete ServiceAccount karpenter-node-logger -n karpenter-node-logger
-kubectl delete Namespace karpenter-node-logger
+kubectl delete deployment karpenter-scale-logger -n karpenter-scale-logger
+kubectl delete ClusterRoleBinding karpenter-scale-logger-binding
+kubectl delete ClusterRole karpenter-scale-logger -n karpenter-scale-logger
+kubectl delete ServiceAccount karpenter-scale-logger -n karpenter-scale-logger
+kubectl delete Namespace karpenter-scale-logger
 
